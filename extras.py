@@ -68,6 +68,44 @@ DOCS = {
          "StepperOnline_T6_Servo_Simple_Manual.pdf"),
     ],
 }
+DOCS.update({
+    "Yaskawa SGM7J-02A (200 W)": [
+        ("Yaskawa SGM7J-02 product page (ratings)", "page",
+         "https://www.yaskawa.eu.com/motion-control/Sigma-7/s7-rotary-servomotors/productdetail/product/sgm7j-02dff21_6842", None),
+        ("Seller listing (Automation Distribution)", "page",
+         "https://automationdistribution.com/yaskawa-sgm7j-02afa61-s7-motor-200w-200v-incremental-keyed-tapered-shaft/", None),
+    ],
+    "Yaskawa SGM7J-04A (400 W)": [
+        ("Yaskawa SGM7J-04 product page (ratings)", "page",
+         "https://www.yaskawa.eu.com/motion-control/Sigma-7/s7-rotary-servomotors/productdetail/product/sgm7j-04afa6s_1966", None),
+        ("Seller listing (Automation Distribution)", "page",
+         "https://automationdistribution.com/yaskawa-sgm7j-04afa6s-s7-motor-400w-200v-incremental-keyed-taper-shaft/", None),
+    ],
+    "Panasonic MSMF022 (200 W)": [
+        ("Distributor spec page (Powermatic)", "page",
+         "https://powermatic.net/part/panasonic/msmf022l1u2/2774006", None),
+    ],
+    "Panasonic MSMF042 (400 W)": [
+        ("Panasonic MSMF042 product page (ratings)", "page",
+         "https://industry.panasonic.com/ap/en/products/motor/fa-motor/ac-servo/number/msmf042l1t2", None),
+        ("Seller listing (e-motionsupply)", "page",
+         "https://www.e-motionsupply.com/Panasonic_AC_Servo_Motors_MSMF042L1U2M_p/msmf042l1u2m.htm", None),
+    ],
+    "Mitsubishi HG-KN23 (200 W)": [
+        ("Mitsubishi HG-KN specifications", "page",
+         "https://us.mitsubishielectric.com/fa/en/products/drive-products/ac-servos-melservo/mrje/motor/specifications/", None),
+    ],
+    "Mitsubishi HG-KN43 (400 W)": [
+        ("Mitsubishi HG-KN specifications", "page",
+         "https://us.mitsubishielectric.com/fa/en/products/drive-products/ac-servos-melservo/mrje/motor/specifications/", None),
+    ],
+    "Mitsubishi HG-KN73 (750 W)": [
+        ("Mitsubishi HG-KN specifications", "page",
+         "https://us.mitsubishielectric.com/fa/en/products/drive-products/ac-servos-melservo/mrje/motor/specifications/", None),
+    ],
+})
+DOCS["StepperOnline T6 400W kit"] = DOCS.pop("StepperOnline T6 400W kit (T6-RS400H2A3-M17S)")
+DOCS["StepperOnline T6 1000W kit"] = DOCS.pop("StepperOnline T6 1000W kit (T6-RS1000H2A3-M17S)")
 DRIVER_DOC = ("ODrive S1 driver datasheet (for CubeMars motors)", "page",
               "https://docs.odriverobotics.com/v/latest/hardware/s1-datasheet.html", None)
 
@@ -288,12 +326,12 @@ def build_report(inp: Inputs, title: str = "Motion axis sizing report") -> bytes
               [(n, f"{q:.4g}", f"{a:.4g}", "PASS" if ok else "FAIL") for n, q, a, ok in r.checks],
               [W * 0.4, W * 0.2, W * 0.2, W * 0.2])
 
-    section("Motor comparison (prices checked 2026-11-12; CubeMars totals include ODrive S1 $149)")
+    section("Motor comparison (prices checked 2026-11-12; totals include the drive)")
     srt = sorted(rows, key=lambda x: (not x["ok"], x["motor"].total_usd is None,
                                       x["motor"].total_usd or 0))
     table(["Motor", "Result", "Total USD", "Supply", "Peak", "Cont.", "Speed", "J ratio"],
           [(x["motor"].model, "PASS" if x["ok"] else "FAIL",
-            f"${x['motor'].total_usd:,.0f}" if x["motor"].total_usd is not None else "non-USD",
+            f"${x['motor'].total_usd:,.0f}" if x["motor"].total_usd is not None else "quote",
             x["motor"].supply, f"{x['peak_use'] * 100:.0f}%", f"{x['rms_use'] * 100:.0f}%",
             f"{x['speed_use'] * 100:.0f}%", f"{x['result'].inertia_ratio:.2f}")
            for x in srt],

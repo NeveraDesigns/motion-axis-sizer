@@ -16,7 +16,7 @@ import streamlit as st
 
 import extras
 
-from sizing import (ALL_MOTORS, CUBEMARS_R, DRIVES, ODRIVE_S1_USD, PRESETS, Inputs, pick_motor,
+from sizing import (ALL_MOTORS, CUBEMARS_R, DRIVES, FAMILIES, INDUSTRIAL, ODRIVE_S1_USD, PRESETS, Inputs, pick_motor,
                     profile_timeseries, size_axis)
 
 # Running on your own Mac (full features) or hosted online (no local folders).
@@ -228,6 +228,11 @@ with st.sidebar:
         st.session_state["accel_pct"] = float(st.session_state["accel_pct"])
         st.slider("Accel time (% of move time)", 5.0, 50.0, key="accel_pct", step=1.0,
                   help="25% is a common starting point. 50% = triangular profile.")
+        st.session_state["s_curve_pct"] = float(st.session_state["s_curve_pct"])
+        st.slider("S-curve smoothing (%)", 0.0, 100.0, key="s_curve_pct", step=5.0,
+                  help="How gradually acceleration builds up and dies away. 0% = sharp corners "
+                       "(trapezoid). Real machines use 30–70% to cut vibration; it raises peak "
+                       "acceleration for the same move time.")
         num("Dwell time (s)", "dwell_s", step=0.05,
             help="Time stopped between moves, e.g. while a part is picked or tested.")
 
@@ -248,6 +253,10 @@ with st.sidebar:
             num("Pinion pitch diameter (mm)", "pinion_pd_mm", min_value=0.1, step=1.0, fmt="%.1f")
             num("Pinion mass (kg)", "pinion_kg", step=0.01)
             num("Rack & pinion efficiency η", "rack_eff", min_value=0.05, step=0.01, fmt="%.2f")
+        num("Drag torque (N·m)", "drag_nm", step=0.01, fmt="%.3f",
+            help="Torque to turn the drive with no load: ball-nut preload, seals, support "
+                 "bearings, belt tension. Use the catalog figure. Typical: small ball screw "
+                 "0.02–0.1, Ø20+ screw 0.05–0.3, belt drive 0.01–0.05 N·m.")
         num("Gearbox ratio (1 = none)", "gear_ratio", min_value=0.01, step=1.0, fmt="%.2f",
             help="Motor turns per output turn. 5 means the motor spins 5× faster than the screw/pulley.")
         num("Gearbox efficiency", "gear_eff", min_value=0.05, step=0.01, fmt="%.2f",
@@ -317,6 +326,9 @@ rows_sorted = sorted(rows, key=lambda x: (not x["ok"], x["motor"].total_usd is N
                                           x["motor"].total_usd or 0))
 passing = [x for x in rows_sorted if x["ok"]]
 priced = [x for x in passing if x["motor"].total_usd is not None]
+ind_order = {m.model: i for i, m in enumerate(INDUSTRIAL)}
+ind_pass = sorted([x for x in rows if x["motor"].family == "Industrial servo" and x["ok"]],
+                  key=lambda x: ind_order[x["motor"].model])
 cube_order = {m.model: i for i, m in enumerate(CUBEMARS_R)}
 cube_pass = sorted([x for x in rows if x["motor"].brand == "CubeMars" and x["ok"]],
                    key=lambda x: cube_order[x["motor"].model])
@@ -345,7 +357,7 @@ st.markdown(f"""
   <div><div class="k">Orientation</div><div class="v">{st.session_state['orientation']}</div></div>
   <div><div class="k">Moving mass</div><div class="v">{r.m_kg:.2f} kg</div></div>
   <div><div class="k">Move</div><div class="v">{inp.stroke_mm:g} mm in {inp.move_time_s:g} s</div></div>
-  <div><div class="k">Cycle</div><div class="v">{r.t_cycle:.2f} s ({cycles_h:,.0f}/h)</div></div>
+  <div><div class="k">Cycle, out and back</div><div class="v">{r.t_cycle:.2f} s ({cycles_h:,.0f}/h)</div></div>
   <div class="verdict {v_cls}"><div class="k">{v_key}</div><div class="v">{v_val}</div></div>
 </div>
 """, unsafe_allow_html=True)
@@ -382,7 +394,7 @@ with tab_res:
             for msg in notes:
                 st.markdown(f"- {msg}")
 
-    st.subheader("Motion and torque over one cycle")
+    st.subheader("Motion and torque over one cycle (out and back)")
     panels = [((1, 1), pos, "#38BDF8", "Position", "Position (mm)"),
               ((1, 2), vel, "#4ADE80", "Velocity", "Velocity (m/s)"),
               ((2, 1), acc, "#F87171", "Acceleration", "Acceleration (m/s²)"),
@@ -397,8 +409,9 @@ with tab_res:
         fig.update_yaxes(title_text=ytitle, title_standoff=8, row=row, col=col)
         fig.update_xaxes(title_text="Time (s)", title_standoff=6, row=row, col=col)
     if inp.motor_rated_nm > 0:
-        fig.add_hline(y=inp.motor_rated_nm, line_dash="dot", line_color="#8FA2BA",
-                      annotation_text="motor rated", row=2, col=2)
+        for sgn in (1, -1):
+            fig.add_hline(y=sgn * inp.motor_rated_nm, line_dash="dot", line_color="#8FA2BA",
+                          annotation_text="motor rated" if sgn > 0 else None, row=2, col=2)
     if inp.motor_peak_nm > 0 and inp.motor_peak_nm < 3 * max(abs(tq.max()), abs(tq.min()), 1e-9):
         fig.add_hline(y=inp.motor_peak_nm, line_dash="dash", line_color="#8FA2BA",
                       annotation_text="motor peak", row=2, col=2)
@@ -417,6 +430,10 @@ with tab_res:
                                 "Force on load (N)": round(f, 3),
                                 "Motor torque (N·m)": round(tqv, 4)} for n, d, f, tqv in r.phases]),
                  hide_index=True, width="stretch")
+    st.caption("Not modeled: how torque falls near a motor's top speed, settling time, belt "
+               "and coupling stiffness, positioning accuracy, and component life. The safety "
+               "factor covers small unknowns; confirm a final choice in the motor maker's "
+               "sizing software.")
 
 # --------------------------------------------------------------------------
 # Tab 2: Motor selection
@@ -425,68 +442,74 @@ with tab_mot:
     st.markdown("Every motor in the catalog is run against your axis, including its own rotor "
                 "inertia. Bigger motors also spend torque spinning themselves up, so bigger "
                 "isn't always better.")
+
+
+    def cost_txt(m):
+        if m.total_usd is not None:
+            return f"${m.total_usd:,.0f}"
+        if m.price is not None and m.currency == "USD":
+            return f"${m.price:,.0f} + drive"
+        if m.price is not None:
+            return f"{price_txt(m)} + driver"
+        return "Quote"
+
+
+    def card(col, title, x, key, empty):
+        with col.container(border=True):
+            st.markdown(f"**{title}**")
+            if x is None:
+                st.markdown(empty)
+                return
+            mm = x["motor"]
+            tt = tightest(x)
+            drive = "drive included" if mm.drive_included else f"drive {mm.drive_model}"
+            st.markdown(f"#### {mm.model}")
+            st.markdown(f"**{cost_txt(mm)}**, {mm.supply}, {drive}  \n"
+                        f"Tightest limit: {tt[0]} at {pct(tt[1])}  \n"
+                        f"Availability: {mm.status}")
+            st.button("Use this motor in the motor check", key=key,
+                      on_click=use_catalog_motor, args=(mm.model,))
+
+
     rc1, rc2 = st.columns(2)
-    with rc1.container(border=True):
-        st.markdown("**Lowest total cost that passes**")
-        if priced:
-            c = priced[0]
-            tt = tightest(c)
-            st.markdown(f"#### {c['motor'].model}")
-            st.markdown(f"**${c['motor'].total_usd:,.2f} total**, {c['motor'].supply}, "
-                        f"{'drive included' if c['motor'].drive_included else 'plus ODrive S1 driver'}  \n"
-                        f"Tightest limit: {tt[0]} at {pct(tt[1])}  \n"
-                        f"Availability: {c['motor'].status}")
-            st.button("Use this motor in the motor check", key="load_cheapest",
-                      on_click=use_catalog_motor, args=(c["motor"].model,))
-        else:
-            st.markdown("None of the priced motors pass this axis.")
-    with rc2.container(border=True):
-        st.markdown("**Smallest CubeMars that passes**")
-        if cube_pass:
-            c = cube_pass[0]
-            tt = tightest(c)
-            total = (f"${c['motor'].total_usd:,.2f} total" if c["motor"].total_usd is not None
-                     else f"{price_txt(c['motor'])} + driver")
-            st.markdown(f"#### {c['motor'].model}")
-            st.markdown(f"**{total}**, {c['motor'].supply}, plus ODrive S1 driver  \n"
-                        f"Tightest limit: {tt[0]} at {pct(tt[1])}  \n"
-                        f"Availability: {c['motor'].status}")
-            st.button("Use this motor in the motor check", key="load_cube",
-                      on_click=use_catalog_motor, args=(c["motor"].model,))
-        else:
-            st.markdown("No CubeMars motor passes this axis.")
+    card(rc1, "Industrial servo: smallest that passes", ind_pass[0] if ind_pass else None,
+         "load_ind", "No industrial servo in the catalog passes this axis.")
+    card(rc2, "Lowest listed total cost that passes", priced[0] if priced else None,
+         "load_cheapest", "None of the priced motors pass this axis.")
     if not passing:
         st.error("No motor in the catalog passes. Try a gearbox (multiplies torque, divides "
                  "reflected inertia), a longer move or accel time, or a finer screw lead or "
                  "smaller pulley if speed isn't the problem.")
 
-    st.subheader("All motors, cheapest passing first")
+    st.subheader("All motors")
+    fam = st.radio("Show", ["All", *FAMILIES], horizontal=True, key="fam_filter", label_visibility="collapsed")
+    shown = [x for x in rows_sorted if fam in (None, "All") or x["motor"].family == fam]
     st.dataframe(pd.DataFrame([{
         "Motor": x["motor"].model,
         "Result": "PASS ✅" if x["ok"] else "FAIL ❌",
-        "Total cost": (f"${x['motor'].total_usd:,.2f}" if x["motor"].total_usd is not None
-                       else f"{price_txt(x['motor'])} + driver"),
-        "Supply": x["motor"].supply,
+        "Total cost": cost_txt(x["motor"]),
         "Peak torque used": pct(x["peak_use"]),
         "Continuous used": pct(x["rms_use"]),
         "Speed used": pct(x["speed_use"]),
         "Inertia ratio": f"{x['result'].inertia_ratio:.2f} : 1",
         "Fails on": ", ".join(x["fails"]) or "—",
+        "Type": x["motor"].family,
+        "Supply": x["motor"].supply,
+        "Drive": ("Included" if x["motor"].drive_included else
+                  x["motor"].drive_model + (f" (${x['motor'].drive_usd:,.0f})" if x["motor"].drive_usd else " (quote)")),
         "Rated / peak (N·m)": f"{x['motor'].rated_nm} / {x['motor'].peak_nm}",
+        "Max speed (rpm)": f"{x['motor'].max_rpm:,.0f}",
         "Rotor inertia (g·cm²)": ("≈" if x["motor"].j_estimated else "") + f"{x['motor'].j_kgm2 * 1e7:,.0f}",
-        "Weight (g)": f"{x['motor'].weight_g:,.0f}",
-        "Motor/kit price": price_txt(x["motor"]),
-        "Driver": "Included" if x["motor"].drive_included else f"+${x['motor'].drive_usd:.0f} ODrive S1",
         "Availability": x["motor"].status,
-        "Seller": x["motor"].url,
-    } for x in rows_sorted]), hide_index=True, width="stretch",
-        column_config={"Seller": st.column_config.LinkColumn("Seller", display_text="Open")})
-    st.caption("% used = what the axis needs (with safety factor) ÷ what the motor can do. "
-               f"CubeMars motors need a separate driver (ODrive S1, ${ODRIVE_S1_USD:.0f}); the "
-               "StepperOnline servo kits include theirs. ≈ = estimated rotor inertia. "
-               "48 V DC motors suit benchtop and low-voltage machines; 220 V AC servo kits are "
-               "standard on industrial equipment. Prices checked online 2026-11-12 and change; "
-               "check the seller before buying.")
+        "Source": x["motor"].url,
+    } for x in shown]), hide_index=True, width="stretch",
+        column_config={"Source": st.column_config.LinkColumn("Source", display_text="Open")})
+    st.caption("Sorted: passing first, then by listed total cost. % used = what the axis needs "
+               "(with safety factor) ÷ what the motor can do. Industrial servos run on 200 V AC "
+               "with a matching drive; prices are new-unit distributor list prices, and most "
+               "makers sell through distributors on quote. Budget kits include their drive. "
+               f"CubeMars robotics motors need a 48 V driver (ODrive S1, ${ODRIVE_S1_USD:.0f}). "
+               "≈ = estimated rotor inertia. Checked online 2026-11-12; prices change.")
 
     st.subheader("Datasheets")
     model_names = [x["motor"].model for x in rows_sorted]
@@ -538,19 +561,23 @@ with tab_how:
     st.markdown("Each step uses the result of the one before. Open a step to see the formula, "
                 "your numbers plugged in, and what it means physically.")
 
-    with st.expander("Step 1: Motion profile (trapezoidal)"):
+    with st.expander("Step 1: Motion profile (S-curve)"):
         S = inp.stroke_mm / 1000
         eq(r"t_a = \text{accel\%} \times t_{move}",
            rf"t_a = {inp.accel_pct/100:.2f} \times {inp.move_time_s:.3f} = {r.t_acc:.4f}\ \text{{s}}",
            "Time spent speeding up. Slowing down takes the same time.")
         eq(r"v_{max} = \dfrac{S}{t_{move} - t_a}",
            rf"v_{{max}} = \dfrac{{{S:.4f}}}{{{inp.move_time_s:.3f} - {r.t_acc:.4f}}} = {r.v_max:.4f}\ \text{{m/s}}",
-           "The area under the velocity trapezoid must equal the stroke. Averaging the ramps "
-           "gives this simple form.")
-        eq(r"a = \dfrac{v_{max}}{t_a}",
-           rf"a = \dfrac{{{r.v_max:.4f}}}{{{r.t_acc:.4f}}} = {r.a:.3f}\ \text{{m/s}}^2 \;({r.a/9.81:.2f}\,g)",
-           "Linear acceleration of the load. Shorter accel time means higher acceleration and "
-           "more torque.")
+           "Whatever the shape of a symmetric speed-up, the load covers half of v·t_a while "
+           "accelerating, so top speed only depends on stroke, move time and accel time.")
+        eq(r"t_j = \dfrac{s}{2}\,t_a \qquad a_{peak} = \dfrac{v_{max}}{t_a - t_j}",
+           rf"t_j = \dfrac{{{inp.s_curve_pct/100:.2f}}}{{2}} \times {r.t_acc:.4f} = {r.t_jerk:.4f}\ \text{{s}}"
+           rf"\qquad a_{{peak}} = \dfrac{{{r.v_max:.4f}}}{{{r.t_acc:.4f} - {r.t_jerk:.4f}}} = {r.a:.3f}\ \text{{m/s}}^2 \;({r.a/9.81:.2f}\,g)",
+           f"With S-curve smoothing s, acceleration ramps up over t_j and down over t_j instead "
+           f"of switching on instantly. That's gentler on the machine but needs a higher peak: "
+           f"{r.a:.3f} vs {r.a_trap:.3f} m/s² for a sharp-cornered profile.")
+        st.markdown(f"*One cycle is move out, dwell, move back, dwell: "
+                    f"2 × ({inp.move_time_s:g} + {inp.dwell_s:g}) = {r.t_cycle:.3f} s.*")
 
     with st.expander("Step 2: Forces on the load"):
         if inp.vertical:
@@ -567,10 +594,14 @@ with tab_how:
         eq(r"F_{const} = F_{friction} + F_{gravity} + F_{ext}",
            rf"F_{{const}} = {r.f_friction:.3f} + {r.f_gravity:.3f} + {r.f_ext:.3f} = {r.f_const:.3f}\ \text{{N}}",
            "The steady force the drive must push against whenever the axis is moving.")
-        eq(r"F_{accel} = m\,a",
+        eq(r"F_{accel} = m\,a_{peak}",
            rf"F_{{accel}} = {r.m_kg:.3f} \times {r.a:.3f} = {r.f_accel:.3f}\ \text{{N}}",
            "Newton's second law: the extra force needed to speed the mass up (and the "
            "force it gives back while slowing down).")
+        st.latex(rf"T_{{drag}} = {inp.drag_nm:.3f}\ \text{{N·m at the drive shaft}}")
+        st.markdown("*Drag torque is a fixed torque to turn the drive at all: ball-nut preload, "
+                    "seals, support bearings or belt tension. Like friction, it always opposes "
+                    "motion. On small axes it is often bigger than the load friction.*")
 
     with st.expander("Step 3: Converting linear to rotary: the transmission constant k"):
         if inp.drive == "Ball screw":
@@ -628,26 +659,33 @@ with tab_how:
            rf"\alpha = \dfrac{{{r.a:.3f}}}{{{r.k:.5g}}} \times {N:.2f} = {r.alpha:.1f}\ \text{{rad/s}}^2",
            "Angular acceleration of the motor shaft.")
 
-    with st.expander("Step 6: Torque in each phase"):
-        eq(r"T_{load} = \dfrac{F_{const}\,k}{\eta\,N}",
-           rf"T_{{load}} = \dfrac{{{r.f_const:.3f} \times {r.k:.5g}}}{{{r.eff_total:.3f} \times {N:.2f}}} = {r.t_load:.5f}\ \text{{N·m}}",
-           "Torque to overcome the steady force. Dividing by efficiency accounts for losses "
-           "in the screw, belt or gears.")
-        eq(r"T_{inertia} = (J_{load} + J_{motor})\,\alpha",
-           rf"T_{{inertia}} = ({r.j_load:.4e} + {r.j_motor:.4e}) \times {r.alpha:.1f} = {r.t_inertia:.5f}\ \text{{N·m}}",
-           "Torque to spin up everything that rotates, including the motor's own rotor. "
-           "This is the rotary version of F = m·a.")
-        st.latex(rf"T_{{accel}} = T_{{load}} + T_{{inertia}} = {r.t_accel_phase:.5f}\ \text{{N·m}}")
-        st.latex(rf"T_{{const}} = T_{{load}} = {r.t_const_phase:.5f}\ \text{{N·m}}")
-        st.latex(rf"T_{{decel}} = T_{{load}} - T_{{inertia}} = {r.t_decel_phase:.5f}\ \text{{N·m}}")
-        st.latex(rf"T_{{dwell}} = \dfrac{{(F_{{gravity}} + F_{{ext}})\,k}}{{\eta\,N}} = {r.t_dwell_phase:.5f}\ \text{{N·m}}")
-        st.markdown("*During deceleration the inertia helps stop the load, so it subtracts. "
-                    "During dwell, only gravity (vertical axes) and external force need holding.*")
+    with st.expander("Step 6: Torque at the motor"):
+        eq(r"T_{shaft} = F\,k + T_{drag}",
+           rf"T_{{shaft,const}} = {r.f_const:.3f} \times {r.k:.5g} + {inp.drag_nm:.3f} = {r.f_const * r.k + inp.drag_nm:.5f}\ \text{{N·m}}",
+           "Force on the load turned into torque at the screw, pulley or pinion, plus the "
+           "drive's own drag. Shown here for moving out at constant speed.")
+        eq(r"T_{motor} = \dfrac{T_{shaft}}{\eta\,N}\ \text{(motor driving)} \qquad "
+           r"T_{motor} = \dfrac{T_{shaft}\,\eta}{N}\ \text{(load driving)}",
+           rf"T_{{const}} = \dfrac{{{r.f_const * r.k + inp.drag_nm:.5f}}}{{{r.eff_total:.3f} \times {N:.2f}}} = {r.t_const_phase:.5f}\ \text{{N·m}}",
+           "Losses always cost the motor. When the motor pushes the load, it supplies the "
+           "losses too (divide by η). When the load pushes back, while braking or lowering a "
+           "vertical load, losses absorb part of it (multiply by η).")
+        eq(r"T_{spin} = \left(\dfrac{J_{drive}}{N^2} + J_{motor}\right)\alpha",
+           rf"T_{{spin}} = \left({r.j_drive / N**2:.4e} + {r.j_motor:.4e}\right) \times {r.alpha:.1f} = {(r.j_drive / N**2 + r.j_motor) * r.alpha:.5f}\ \text{{N·m}}",
+           "Extra torque at peak acceleration to spin up the screw or pulleys and the motor's "
+           "own rotor. The moving mass is already included in F.")
+        st.latex(rf"T_{{accel,peak}} = {r.t_accel_phase:.5f} \quad T_{{const}} = {r.t_const_phase:.5f} \quad "
+                 rf"T_{{decel,peak}} = {r.t_decel_phase:.5f} \quad T_{{dwell}} = {r.t_dwell_phase:.5f}\ \text{{N·m}}")
+        if inp.vertical:
+            st.markdown(f"*Moving back down, gravity helps: steady torque is "
+                        f"{r.t_back_const:.5f} N·m instead of {r.t_const_phase:.5f} N·m going up. "
+                        "During dwell the motor holds the load against gravity.*")
+        st.markdown("*The app evaluates these at 6,000 points through the cycle, so the S-curve "
+                    "ramps and every change of direction are included.*")
 
     with st.expander("Step 7: Peak and RMS torque"):
-        terms = " + ".join(rf"{tv:.4f}^2({d:.3f})" for _, d, _, tv in r.phases)
-        eq(r"T_{rms} = \sqrt{\dfrac{\sum T_i^2\,t_i}{t_{cycle}}}",
-           rf"T_{{rms}} = \sqrt{{\dfrac{{{terms}}}{{{r.t_cycle:.3f}}}}} = {r.t_rms:.5f}\ \text{{N·m}}",
+        eq(r"T_{rms} = \sqrt{\dfrac{1}{t_{cycle}}\int_0^{t_{cycle}} T(t)^2\,dt}",
+           rf"T_{{rms}} = \sqrt{{\dfrac{{1}}{{{r.t_cycle:.3f}}}\int_0^{{{r.t_cycle:.3f}}} T(t)^2\,dt}} = {r.t_rms:.5f}\ \text{{N·m}}",
            "RMS torque is the motor's 'average heating' torque. Motor heat goes with current "
            "squared, and current is proportional to torque. RMS must stay below the "
            "continuous (rated) torque or the motor overheats over time.")
@@ -658,8 +696,8 @@ with tab_how:
         eq(r"T_{required} = T \times SF",
            rf"T_{{peak,req}} = {r.t_peak:.4f} \times {inp.safety_factor:.2f} = {r.t_peak_req:.4f}"
            rf"\qquad T_{{rms,req}} = {r.t_rms:.4f} \times {inp.safety_factor:.2f} = {r.t_rms_req:.4f}",
-           "Margin covers what the model leaves out: couplings, bearing drag, seals, cable "
-           "carriers, belt tension, and tuning.")
+           "Margin covers what the model leaves out: coupling inertia, cable carriers, "
+           "torque fall-off near top speed, and tuning.")
 
 
 # --------------------------------------------------------------------------

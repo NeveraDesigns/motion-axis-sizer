@@ -13,16 +13,19 @@ it used.
 
 ## What it does
 
-- **Sizes the axis.** Trapezoidal motion profile, forces, reflected inertia, motor speed,
-  torque in every phase of the cycle, and peak and RMS torque with a safety factor.
+- **Sizes the axis.** S-curve motion profile, forces, drive drag torque, reflected inertia,
+  motor speed, and torque at every instant of a full out-and-back cycle (including gravity
+  helping on the way down and losses switching direction when the load drives the motor),
+  then peak and RMS torque with a safety factor.
 - **Handles three drive types**: ball screw, belt and pulley, rack and pinion, with an
   optional gearbox.
 - **Checks a motor** from its datasheet. It reports PASS or FAIL on peak torque,
   continuous torque, speed and load-to-rotor inertia ratio, and explains failures in
   plain English.
-- **Compares real motors.** CubeMars 48 V outrunner motors are compared with StepperOnline
-  220 V AC servo kits, ranked by total cost including the driver. It picks the cheapest
-  motor that passes and the smallest CubeMars that passes.
+- **Compares real motors.** Industrial servos (Yaskawa Sigma-7, Panasonic MINAS A6,
+  Mitsubishi MELSERVO-JE), budget servo kits (StepperOnline) and robotics torque motors
+  (CubeMars), ranked by total cost including the drive. It picks the smallest industrial
+  servo that passes and the lowest listed cost that passes.
 - **Shows its work.** Every formula is shown with your numbers plugged in and a sentence on
   what it means physically.
 - **Saves and compares designs** side by side, and exports a one-page PDF report or a CSV.
@@ -69,11 +72,13 @@ python test_hand_calc.py
 
 ## Model assumptions
 
-- Trapezoidal or triangular move profile, with equal acceleration and deceleration times.
-- Vertical axes are sized moving up, the worst case. Guide friction is ignored on vertical axes.
-- External force acts for the whole cycle.
+- S-curve move profile (0 % smoothing = trapezoid), equal acceleration and deceleration times.
+- One cycle is move out, dwell, move back, dwell. Vertical axes lift on the way out.
+- Guide friction is ignored on vertical axes. External force acts for the whole cycle.
+- Drag torque is constant whenever the axis moves.
 - Ball screw modeled as a solid steel cylinder; pulleys and pinions as solid discs.
-- Couplings, bearings, seals and cable carriers are covered by the safety factor.
+- Not modeled: torque fall-off near top speed, settling, compliance, accuracy and life.
+- Coupling inertia and cable carriers are covered by the safety factor.
 - Motor prices were checked online on 2026-11-12 and change. Rotor inertia for some
   CubeMars motors is estimated and marked with ≈.
 

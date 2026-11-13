@@ -1,5 +1,6 @@
 #!/bin/bash
-# Double-click to publish this folder's latest version to GitHub.
+# Double-click to sync this folder with GitHub: uploads your changes and
+# downloads any changes published elsewhere (for example by Claude).
 # The online app (Streamlit) picks up the new version a minute or two later.
 #
 # First run only: connects this folder to GitHub and signs you in through
@@ -70,33 +71,46 @@ fi
 git config user.name "$AUTHOR_NAME"
 git config user.email "$AUTHOR_EMAIL"
 
-# 5. Anything new?
+# 5. Commit anything new on this Mac
 git add -A
-if git diff --cached --quiet; then
-  echo "Nothing new to publish. GitHub already has your latest version."
-  pause_exit 0
+HAVE_LOCAL=0
+if ! git diff --cached --quiet; then
+  HAVE_LOCAL=1
+  echo "Changes on this Mac:"
+  git diff --cached --stat | sed 's/^/  /'
+  echo ""
+  read -r -t 60 -p "Short note about what changed (or just press Enter): " NOTE
+  echo ""
+  [ -z "$NOTE" ] && NOTE="Update from Mac ($(date '+%Y-%m-%d %H:%M'))"
+  git commit -q -m "$NOTE"
 fi
-echo "Changes to publish:"
-git diff --cached --stat | sed 's/^/  /'
-echo ""
-read -r -t 60 -p "Short note about what changed (or just press Enter): " NOTE
-echo ""
-[ -z "$NOTE" ] && NOTE="Update from Mac ($(date '+%Y-%m-%d %H:%M'))"
-git commit -q -m "$NOTE"
 
-# 6. Bring in anything published from elsewhere, then upload
-git fetch -q origin main
+# 6. Bring in anything published elsewhere (by Claude or another computer)
+BEFORE="$(git rev-parse HEAD)"
+git fetch -q origin main || { echo "Couldn't reach GitHub. Check your internet."; pause_exit 1; }
 if ! git rebase -q origin/main; then
   git rebase --abort
   echo "GitHub has changes that clash with yours, so nothing was uploaded."
   echo "Your files are untouched. Ask Claude to help merge them."
   pause_exit 1
 fi
-if git push -q origin main; then
-  echo "Published. $REPO_PAGE"
-  echo "The online app updates in a minute or two."
-  pause_exit 0
-else
-  echo "Upload failed. Check your internet, then double-click this file again."
-  pause_exit 1
+PULLED=0
+[ "$(git rev-parse HEAD)" != "$BEFORE" ] && [ "$HAVE_LOCAL" = 0 ] && PULLED=1
+
+# 7. Upload if this Mac has anything GitHub doesn't
+if [ -n "$(git log --oneline origin/main..HEAD)" ]; then
+  if git push -q origin main; then
+    echo "Published. $REPO_PAGE"
+    echo "The online app updates in a minute or two."
+    pause_exit 0
+  else
+    echo "Upload failed. Check your internet, then double-click this file again."
+    pause_exit 1
+  fi
 fi
+if [ "$PULLED" = 1 ] || [ "$HAVE_LOCAL" = 1 ]; then
+  echo "Updated this folder with the latest version from GitHub. Nothing new to upload."
+else
+  echo "Everything is up to date. Your Mac and GitHub match."
+fi
+pause_exit 0
