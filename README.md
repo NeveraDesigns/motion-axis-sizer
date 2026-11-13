@@ -7,6 +7,8 @@ You describe the axis (load, move and drive). The tool works out the torque, spe
 inertia the motor needs, checks real motors against those numbers, and shows every equation
 it used.
 
+**Try it online: https://motion-axis-sizer.streamlit.app**
+
 ![Results tab](docs/screenshot-results.png)
 
 ## What it does
@@ -29,7 +31,7 @@ it used.
 
 ## Run it
 
-**Online:** see the link at the top of this repository.
+**Online:** https://motion-axis-sizer.streamlit.app (nothing to install).
 
 **On a Mac:** double-click `Start Motion Sizer.command`. The first run installs what it
 needs; after that the tool opens at http://localhost:8501 in a few seconds.
