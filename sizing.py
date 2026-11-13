@@ -74,6 +74,11 @@ class Inputs:
     motor_peak_nm: float = 0.0
     motor_max_rpm: float = 0.0
     motor_j_kgm2: float = 0.0
+    motor_rated_rpm: float = 0.0      # 0 = not entered (assume half of max speed)
+    # Torque-speed envelope shape (approximate, see torque_envelope)
+    env_cont_end: float = 0.5         # continuous torque at max speed, fraction of rated
+    env_peak_knee_rpm: float = 0.0    # peak torque held up to this speed (0 = rated speed)
+    env_peak_end: float = 0.35        # peak-zone torque at max speed, fraction of peak
     # Margins
     safety_factor: float = 1.5
     max_inertia_ratio: float = 10.0
@@ -125,7 +130,12 @@ class Results:
     t_rms: float = 0.0
     t_peak_req: float = 0.0
     t_rms_req: float = 0.0
-    phases: list = field(default_factory=list)   # (name, duration, peak force N, peak torque N·m)
+    phases: list = field(default_factory=list)   # (name, duration, force N at peak torque, peak torque N·m)
+    phase_ranges: list = field(default_factory=list)  # (lowest, highest) motor torque in each phase
+    rpm: np.ndarray | None = None  # motor speed (signed) over the cycle
+    env_rpm_worst: float = 0.0     # speed where torque-vs-speed is tightest
+    governing: tuple | None = None # (check name, fraction of limit used) for the tightest check
+    brake_note: str = ""
     checks: list = field(default_factory=list)   # (name, required, available, ok)
     warnings: list = field(default_factory=list)
     motor_entered: bool = False
@@ -181,6 +191,31 @@ def _one_move(t, ta, tj, tc, a_pk):
     return a_pk * (_accel_shape(t, ta, tj) - _accel_shape(t - ta - tc, ta, tj))
 
 
+def torque_envelope(n_rpm, rated, peak, rated_rpm, max_rpm,
+                    cont_end=0.5, peak_knee_rpm=0.0, peak_end=0.35):
+    """Approximate torque a motor can give at speed n (rpm): (continuous, peak zone).
+
+    Continuous zone: rated torque up to rated speed, then a straight line down to
+    cont_end x rated at max speed. Peak (intermittent) zone: peak torque up to the
+    knee speed, then a straight line down to peak_end x peak at max speed. Above max
+    speed nothing is available. Real curves come from the maker's datasheet and
+    depend on drive and supply voltage; this shape is a stand-in for early sizing.
+    """
+    n = np.abs(np.asarray(n_rpm, dtype=float))
+    rated_rpm = rated_rpm if rated_rpm > 0 else max_rpm / 2
+    knee = peak_knee_rpm if peak_knee_rpm > 0 else rated_rpm
+    knee = min(knee, max_rpm)
+
+    def ramp(x0, y0, y1):
+        span = max(max_rpm - x0, 1e-9)
+        return np.where(n <= x0, y0, y0 + (y1 - y0) * (n - x0) / span)
+
+    cont = ramp(min(rated_rpm, max_rpm), rated, cont_end * rated)
+    pk = np.maximum(ramp(knee, peak, peak_end * peak), cont)
+    over = n > max_rpm * (1 + 1e-9)
+    return np.where(over, 0.0, cont), np.where(over, 0.0, pk)
+
+
 def size_axis(inp: Inputs, n: int = 6000) -> Results:
     r = Results()
     N = inp.gear_ratio if inp.gear_ratio > 0 else 1.0
@@ -231,10 +266,20 @@ def size_axis(inp: Inputs, n: int = 6000) -> Results:
     r.alpha = r.a / r.k * N
 
     # 5. Time history over the full cycle -------------------------------------
-    dt = r.t_cycle / n
-    ts = (np.arange(n) + 0.5) * dt                      # bin centres (midpoint rule)
-    tm = np.mod(ts, T + inp.dwell_s)                    # time within out or back half
-    back = ts >= (T + inp.dwell_s)
+    # Most samples go to the moves; torque is constant while stopped, so dwells
+    # need only a few. That keeps short, fast moves well resolved even when a
+    # long dwell dominates the cycle. Each sample is the midpoint of its slice.
+    half = T + inp.dwell_s
+    n_dw = 40 if inp.dwell_s > 0 else 0
+    n_mv = max(200, n // 2 - n_dw)
+    t_mv = (np.arange(n_mv) + 0.5) * (T / n_mv)
+    t_dw = T + (np.arange(n_dw) + 0.5) * (inp.dwell_s / max(n_dw, 1))
+    t_half = np.concatenate([t_mv, t_dw])
+    w_half = np.concatenate([np.full(n_mv, T / n_mv), np.full(n_dw, inp.dwell_s / max(n_dw, 1))])
+    ts = np.concatenate([t_half, t_half + half])
+    wts = np.concatenate([w_half, w_half])
+    tm = np.concatenate([t_half, t_half])                 # time within out or back half
+    back = ts >= half
     sign = np.where(back, -1.0, 1.0)
     moving = tm < T
     acc = np.where(moving, _one_move(tm, r.t_acc, r.t_jerk, r.t_const, r.a), 0.0) * sign
@@ -258,9 +303,10 @@ def size_axis(inp: Inputs, n: int = 6000) -> Results:
                      np.where(motoring, t_shaft / (eta * N), t_shaft * eta / N))
     tq = t_mot + j_rot * acc / r.k * N
     r.ts, r.pos, r.vel, r.acc, r.tq = ts, pos * 1000, vel, acc, tq
+    r.rpm = vel / r.k * N * 60 / (2 * math.pi)
 
     r.t_peak = float(np.max(np.abs(tq)))
-    r.t_rms = float(np.sqrt(np.mean(tq**2)))
+    r.t_rms = float(np.sqrt(np.sum(tq**2 * wts) / r.t_cycle))
     r.t_peak_req = r.t_peak * inp.safety_factor
     r.t_rms_req = r.t_rms * inp.safety_factor
 
@@ -280,11 +326,12 @@ def size_axis(inp: Inputs, n: int = 6000) -> Results:
     seg_bc = back & moving & (tm >= r.t_acc) & (tm < T - r.t_acc)
     r.t_back_const = float(tq[seg_bc].mean()) if seg_bc.any() else 0.0
 
-    def peak(x, m):
+    def at_peak(m):
+        """(force at the instant of peak torque, peak torque, lowest, highest)."""
         if not m.any():
-            return 0.0
-        i = np.argmax(np.abs(x[m]))
-        return float(x[m][i])
+            return 0.0, 0.0, 0.0, 0.0
+        i = np.argmax(np.abs(tq[m]))
+        return float(F[m][i]), float(tq[m][i]), float(tq[m].min()), float(tq[m].max())
 
     names = ("Accelerate", "Constant velocity", "Decelerate", "Dwell")
     dur = (r.t_acc, r.t_const, r.t_acc, inp.dwell_s)
@@ -294,17 +341,40 @@ def size_axis(inp: Inputs, n: int = 6000) -> Results:
                 half & moving & (tm >= T - r.t_acc),
                 half & ~moving)
         for nm, du, m in zip(names, dur, segs):
-            r.phases.append((f"{nm} ({label})", du, peak(F, m), peak(tq, m)))
+            f_pk, t_pk, t_lo, t_hi = at_peak(m)
+            r.phases.append((f"{nm} ({label})", du, f_pk, t_pk))
+            r.phase_ranges.append((t_lo, t_hi))
 
     # 6. Motor checks ----------------------------------------------------------
     r.motor_entered = any(v > 0 for v in (inp.motor_rated_nm, inp.motor_peak_nm,
                                           inp.motor_max_rpm, inp.motor_j_kgm2))
+    rpm_abs = np.abs(r.rpm)
+    rated_rpm = inp.motor_rated_rpm if inp.motor_rated_rpm > 0 else inp.motor_max_rpm / 2
     if inp.motor_peak_nm > 0:
         r.checks.append(("Peak torque (N·m)", r.t_peak_req, inp.motor_peak_nm,
                          r.t_peak_req <= inp.motor_peak_nm))
+    have_env = inp.motor_peak_nm > 0 and inp.motor_rated_nm > 0 and inp.motor_max_rpm > 0
+    if have_env:
+        _, pk_avail = torque_envelope(rpm_abs, inp.motor_rated_nm, inp.motor_peak_nm, rated_rpm,
+                                      inp.motor_max_rpm, inp.env_cont_end,
+                                      inp.env_peak_knee_rpm, inp.env_peak_end)
+        need = np.abs(tq) * inp.safety_factor
+        use = np.where(pk_avail > 0, need / np.maximum(pk_avail, 1e-12),
+                       np.where(need > 0, np.inf, 0.0))
+        i = int(np.argmax(use))
+        r.env_rpm_worst = float(rpm_abs[i])
+        r.checks.append((f"Torque at speed (N·m at {rpm_abs[i]:,.0f} rpm)", float(need[i]),
+                         float(pk_avail[i]), bool(use[i] <= 1.0)))
     if inp.motor_rated_nm > 0:
-        r.checks.append(("RMS vs rated torque (N·m)", r.t_rms_req, inp.motor_rated_nm,
-                         r.t_rms_req <= inp.motor_rated_nm))
+        if have_env:
+            n_avg = float(np.sum(rpm_abs * wts) / r.t_cycle)
+            cont_avail = float(torque_envelope(n_avg, inp.motor_rated_nm, inp.motor_peak_nm,
+                                               rated_rpm, inp.motor_max_rpm, inp.env_cont_end,
+                                               inp.env_peak_knee_rpm, inp.env_peak_end)[0])
+        else:
+            cont_avail = inp.motor_rated_nm
+        r.checks.append(("RMS vs continuous torque (N·m)", r.t_rms_req, cont_avail,
+                         r.t_rms_req <= cont_avail))
     if inp.motor_max_rpm > 0:
         r.checks.append(("Max speed (rpm)", r.rpm_max, inp.motor_max_rpm,
                          r.rpm_max <= inp.motor_max_rpm))
@@ -314,6 +384,8 @@ def size_axis(inp: Inputs, n: int = 6000) -> Results:
                          r.inertia_ratio <= inp.max_inertia_ratio))
     if r.checks:
         r.overall_ok = all(c[3] for c in r.checks)
+        uses = [(c[0].split(" (")[0], c[1] / c[2] if c[2] > 0 else float("inf")) for c in r.checks]
+        r.governing = max(uses, key=lambda u: u[1])
 
     # Plain-English warnings ----------------------------------------------------
     w = r.warnings
@@ -329,9 +401,14 @@ def size_axis(inp: Inputs, n: int = 6000) -> Results:
                 w.append(f"Peak torque needed ({req:.3f} N·m with safety factor) is more than "
                          f"the motor's peak rating ({avail:.3f} N·m). Choose a bigger motor, add "
                          "a gearbox, or lengthen the acceleration time.")
+            elif name.startswith("Torque at speed"):
+                w.append(f"At {r.env_rpm_worst:,.0f} rpm the motor can give only about "
+                         f"{avail:.3f} N·m, but the move needs {req:.3f} N·m there (with safety "
+                         "factor). A motor's torque falls as it nears top speed. Choose a motor "
+                         "with more speed headroom, a finer screw lead or a smaller pulley.")
             elif name.startswith("RMS"):
                 w.append(f"RMS torque ({req:.3f} N·m with safety factor) exceeds the motor's "
-                         f"continuous rating ({avail:.3f} N·m). The motor will overheat over "
+                         f"continuous torque ({avail:.3f} N·m at this axis's average speed). The motor will overheat over "
                          "time. Add dwell, slow the move, or pick a bigger motor.")
             elif name.startswith("Max speed"):
                 w.append(f"Required speed ({req:.0f} rpm) is above the motor's max "
@@ -355,12 +432,16 @@ def size_axis(inp: Inputs, n: int = 6000) -> Results:
         w.append(f"S-curve smoothing raises peak acceleration to {r.a:.2f} m/s², "
                  f"{(r.a / r.a_trap - 1) * 100:.0f}% above a sharp-cornered profile, in "
                  "exchange for less vibration and faster settling.")
-    if inp.vertical and inp.dwell_s > 0:
-        w.append("Vertical axis: the motor must hold the load during dwell. Most designs "
-                 "add a motor brake so the load can't drop when power is off.")
-    if inp.vertical and inp.drive != "Ball screw":
-        w.append("Vertical belt or rack axes back-drive easily. You will need a brake "
-                 "and possibly a counterbalance.")
+    if inp.vertical:
+        r.brake_note = (
+            f"Vertical axis: while powered, the motor holds the load with "
+            f"{abs(r.t_dwell_phase):.3f} N·m during dwell. With power off, nothing holds it"
+            + (", and a belt or rack axis drops immediately" if inp.drive != "Ball screw"
+               else ", and most ball screws back-drive")
+            + ". Choose the motor's brake option (or a counterbalance) so the load can't fall.")
+    if inp.motor_rated_nm > 0 and inp.motor_rated_rpm <= 0 and inp.motor_max_rpm > 0:
+        w.append("Rated speed not entered, so the torque-vs-speed check assumes half the max "
+                 "speed. Enter the datasheet's rated speed for a better check.")
     if np.min(tq * np.sign(r.vel + 1e-30)) < 0 and np.any(r.vel != 0):
         w.append("At times the load drives the motor (braking, or lowering a vertical "
                  "load), so energy flows back into the drive. Fine for most servo drives; "
@@ -378,22 +459,23 @@ PRESETS = {
         drive="Belt & pulley", payload_kg=0.5, carriage_kg=0.2, vertical=False, mu=0.01,
         stroke_mm=300, move_time_s=0.4, accel_pct=25, s_curve_pct=50, dwell_s=0.2,
         pulley_pd_mm=30, pulley_kg=0.05, belt_eff=0.95, drag_nm=0.02,
-        motor_rated_nm=0.64, motor_peak_nm=1.91, motor_max_rpm=6000, motor_j_kgm2=1.8e-5),
+        motor_rated_nm=0.64, motor_peak_nm=1.91, motor_max_rpm=6000, motor_j_kgm2=1.8e-5, motor_rated_rpm=3000),
     "Vertical Z pick axis": Inputs(
         drive="Ball screw", payload_kg=0.3, carriage_kg=0.2, vertical=True, mu=0.01,
         stroke_mm=20, move_time_s=0.1, accel_pct=25, s_curve_pct=50, dwell_s=0.3,
         lead_mm=10, screw_dia_mm=8, screw_len_mm=150, screw_eff=0.9, drag_nm=0.02,
-        motor_rated_nm=0.32, motor_peak_nm=0.95, motor_max_rpm=6000, motor_j_kgm2=6e-6),
+        motor_rated_nm=0.32, motor_peak_nm=0.95, motor_max_rpm=6000, motor_j_kgm2=6e-6, motor_rated_rpm=3000),
     "Heavy shuttle": Inputs(
         drive="Ball screw", payload_kg=5.0, carriage_kg=1.0, vertical=False, mu=0.01,
         stroke_mm=500, move_time_s=1.0, accel_pct=25, s_curve_pct=50, dwell_s=0.5,
         lead_mm=20, screw_dia_mm=20, screw_len_mm=700, screw_eff=0.9, drag_nm=0.08,
-        motor_rated_nm=1.27, motor_peak_nm=3.82, motor_max_rpm=6000, motor_j_kgm2=3.7e-5),
+        motor_rated_nm=1.27, motor_peak_nm=3.82, motor_max_rpm=6000, motor_j_kgm2=3.7e-5, motor_rated_rpm=3000),
 }
 
 
 # ---------------------------------------------------------------------------
-# Motor catalog. Specs and prices checked online 2026-11-12; see
+# Motor catalog: a market search across makers. Specs and prices checked online
+# 2026-11-12; see
 # datasheets/DATASHEET INDEX.md for every source.
 #
 # Families
@@ -410,7 +492,9 @@ PRESETS = {
 # R60 and RO80 Lite values).
 # ---------------------------------------------------------------------------
 ODRIVE_S1_USD = 149.0
-FAMILIES = ("Industrial servo", "Budget servo kit", "Robotics torque motor")
+FAMILIES = ("Industrial servo", "Integrated servo", "Budget servo kit", "Robotics torque motor")
+ROBUST_FAMILIES = ("Industrial servo", "Integrated servo")
+ROBUST_RESERVE = 0.30   # "robust" = at least 30 % spare on every check
 
 
 @dataclass
@@ -434,6 +518,11 @@ class Motor:
     seller: str = ""
     status: str = ""
     url: str = ""
+    rated_rpm: float = 3000.0         # speed up to which rated torque holds
+    cont_end: float = 0.5             # continuous torque at max speed, fraction of rated
+    peak_knee_rpm: float = 0.0        # peak torque held up to here (0 = rated speed)
+    peak_end: float = 0.35            # peak-zone torque at max speed, fraction of peak
+    curve_note: str = "Approximate shape from rated, peak and speed ratings."
 
     @property
     def total_usd(self):
@@ -490,6 +579,80 @@ ALL_MOTORS = [
           seller="Mitsubishi distributor (quote)", status="Quote",
           url="https://us.mitsubishielectric.com/fa/en/products/drive-products/ac-servos-melservo/mrje/motor/specifications/",
           note="MELSERVO-JE low inertia."),
+    # AutomationDirect SureServo2 (230 V AC). Motor list prices from the June 2025
+    # SureServo2 selection guide; SV2A-2040 drive $429 and SV2L-202B $521 are the
+    # current automationdirect.com prices. Curve shape from the published 230 V
+    # torque-speed charts (peak held to about 4000 rpm, ~30 % of peak at 6000 rpm).
+    Motor("AutomationDirect SV2L-202N (200 W)", 0.64, 2.24, 6000, 0.25e-4, 1100,
+          brand="AutomationDirect", family="Industrial servo", supply="230 V AC",
+          drive_model="SV2A-2040", price=315.0, drive_usd=429.0,
+          seller="AutomationDirect", status="List price (motor: 2025 guide)",
+          url="https://cdn.automationdirect.com/static/specs/ss2motors.pdf",
+          peak_knee_rpm=4000, peak_end=0.30, curve_note="Shape from AutomationDirect's 230 V curves.",
+          note="SureServo2 low inertia. Sold online at published prices."),
+    Motor("AutomationDirect SV2L-202B (200 W, brake)", 0.64, 2.24, 6000, 0.28e-4, 1600,
+          brand="AutomationDirect", family="Industrial servo", supply="230 V AC",
+          drive_model="SV2A-2040", price=521.0, drive_usd=429.0,
+          seller="AutomationDirect", status="In catalog, list price",
+          url="https://www.automationdirect.com/adc/shopping/catalog/motion_control/sureservo2_(sv2a_series)_servo_systems/115-z-230v_servo_motors,_drives,_motor_cables/sv2l-202b",
+          peak_knee_rpm=4000, peak_end=0.30, curve_note="Shape from AutomationDirect's 230 V curves.",
+          note="Same motor with a holding brake: the choice for a vertical axis."),
+    Motor("AutomationDirect SV2L-204N (400 W)", 1.27, 3.96, 6000, 0.45e-4, 1400,
+          brand="AutomationDirect", family="Industrial servo", supply="230 V AC",
+          drive_model="SV2A-2040", price=340.0, drive_usd=429.0,
+          seller="AutomationDirect", status="List price (motor: 2025 guide)",
+          url="https://cdn.automationdirect.com/static/specs/ss2motors.pdf",
+          peak_knee_rpm=4000, peak_end=0.30, curve_note="Shape from AutomationDirect's 230 V curves.",
+          note="SureServo2 low inertia."),
+    Motor("AutomationDirect SV2L-207N (750 W)", 2.39, 7.86, 6000, 1.51e-4, 2800,
+          brand="AutomationDirect", family="Industrial servo", supply="230 V AC",
+          drive_model="SV2A-2075", price=364.0, drive_usd=477.0,
+          seller="AutomationDirect", status="List price (2025 guide)",
+          url="https://cdn.automationdirect.com/static/specs/ss2motors.pdf",
+          peak_knee_rpm=4000, peak_end=0.30, curve_note="Shape from AutomationDirect's 230 V curves.",
+          note="SureServo2 low inertia."),
+    # Delta ASDA-B3 (220 V AC). Specs from Delta's ASDA-B3 catalog.
+    Motor("Delta ECM-B3M-C20602 (200 W)", 0.64, 2.24, 6000, 0.141e-4, 900,
+          brand="Delta", family="Industrial servo", supply="220 V AC",
+          drive_model="ASD-B3-0221", price=None, drive_usd=None,
+          seller="Delta distributor (quote)", status="Quote",
+          url="https://www.mouser.com/datasheet/2/632/DELTA_IA_ASDA_ASDA_B3_C_EN_20230523_web-3318784.pdf",
+          note="ASDA-B3 low inertia."),
+    Motor("Delta ECM-B3M-C20604 (400 W)", 1.27, 4.45, 6000, 0.254e-4, 1200,
+          brand="Delta", family="Industrial servo", supply="220 V AC",
+          drive_model="ASD-B3-0421", price=918.22, currency="CAD", drive_usd=None,
+          seller="DigiKey Canada", status="Motor C$918; drive quote",
+          url="https://www.digikey.ca/en/products/detail/delta-electronics-industrial-automation/ECM-B3M-C20604RS1/21852603",
+          note="ASDA-B3 low inertia. Price in Canadian dollars, motor only."),
+    Motor("Delta ECM-B3M-C20807 (750 W)", 2.4, 8.4, 6000, 1.07e-4, 2340,
+          brand="Delta", family="Industrial servo", supply="220 V AC",
+          drive_model="ASD-B3-0721", price=None, drive_usd=None,
+          seller="Delta distributor (quote)", status="Quote",
+          url="https://www.mouser.com/datasheet/2/632/DELTA_IA_ASDA_ASDA_B3_C_EN_20230523_web-3318784.pdf",
+          note="ASDA-B3 medium inertia."),
+    # Omron 1S (200 V AC)
+    Motor("Omron R88M-1M40030T (400 W)", 1.27, 4.5, 6000, 0.44e-4, None,
+          brand="Omron", family="Industrial servo", supply="200 V AC",
+          drive_model="R88D-1SN04H-ECT", price=2116.95, currency="NZD", drive_usd=None,
+          seller="RS New Zealand", status="Motor NZ$2,117; drive quote",
+          url="https://nz.rs-online.com/web/p/servo-motors/1362816",
+          note="1S series. Price in New Zealand dollars, motor only."),
+    # Leadshine EL7 / ELM2H (220 V AC)
+    Motor("Leadshine ELM2H-0400LA60F (400 W)", 1.27, 3.81, 6500, 0.56e-4, 1300,
+          brand="Leadshine", family="Industrial servo", supply="220 V AC",
+          drive_model="EL7-EC400F", price=None, drive_usd=None,
+          seller="Leadshine distributor (quote)", status="Quote",
+          url="https://www.leadshine.com/product-detail/ELM2H-0400LA60F.html",
+          note="Pairs with the EL7 EtherCAT drive."),
+    # Integrated servos (motor + drive + encoder in one housing)
+    Motor("Teknic ClearPath CPM-SDSK-2321S", 0.7, 3.5, 3240, 0.2e-4, 900,
+          brand="Teknic", family="Integrated servo", supply="75 V DC (supply extra)",
+          drive_model="built in", price=315.0, drive_included=True,
+          seller="Teknic", status="In stock, list price",
+          url="https://teknic.com/model-info/CPM-SDSK-2321S-RLN/",
+          rated_rpm=1950, cont_end=0.6, peak_knee_rpm=1100, peak_end=0.3,
+          curve_note="DC-bus motor: torque falls steadily with speed (approximate).",
+          note="NEMA 23 with drive built in. Specs at 75 V DC."),
     # Budget servo kits --------------------------------------------------------
     Motor("StepperOnline T6 400W kit", 1.27, 3.81, 5000, 0.56e-4, 1300,
           brand="StepperOnline", family="Budget servo kit", supply="220 V AC",
@@ -509,31 +672,40 @@ ALL_MOTORS = [
           price=177.90, drive_usd=ODRIVE_S1_USD, seller="OZ Robotics",
           status="Discontinued (successor: RO60)",
           url="https://ozrobotics.com/shop/cubemars-r60-kv115-bldc-motor-with-built-in-hall-sensor/",
-          note="Your motor. All values from datasheet."),
+          note="Your motor. All values from datasheet.",
+          cont_end=1.0, peak_end=0.0, curve_note="Rated torque held to the listed speed; peak falls toward rated near it (48 V)."),
     Motor("CubeMars RO60 KV115", 0.8, 2.4, 4200, 1161e-7, 248, brand="CubeMars",
           family="Robotics torque motor", supply="48 V DC", drive_model="ODrive S1",
           price=85.90, drive_usd=ODRIVE_S1_USD, seller="DigiKey", status="In stock",
           url="https://www.digikey.com/en/products/detail/cubemars/RO60-KV115/27612270",
-          note="R60 successor, same ratings. Inertia from R60 datasheet."),
+          note="R60 successor, same ratings. Inertia from R60 datasheet.",
+          cont_end=1.0, peak_end=0.0, curve_note="Rated torque held to the listed speed; peak falls toward rated near it (48 V)."),
     Motor("CubeMars RO80 KV105", 1.3, 4.0, 3600, 2125e-7, 352, j_estimated=True,
           brand="CubeMars", family="Robotics torque motor", supply="48 V DC",
           drive_model="ODrive S1", price=100.99, currency="EUR", drive_usd=ODRIVE_S1_USD,
           seller="MAB Robotics (EU)", status="Listed",
           url="https://www.mabrobotics.pl/product-page/ro80-cubemars-t-motor",
-          note="Inertia scaled from RO80 Lite datasheet (1,600 g·cm²) by weight."),
+          note="Inertia scaled from RO80 Lite datasheet (1,600 g·cm²) by weight.",
+          cont_end=1.0, peak_end=0.0, curve_note="Rated torque held to the listed speed; peak falls toward rated near it (48 V)."),
     Motor("CubeMars R80 KV110", 1.3, 4.0, 3600, 2490e-7, 354, j_estimated=True,
           brand="CubeMars", family="Robotics torque motor", supply="48 V DC",
           drive_model="ODrive S1", price=258.90, drive_usd=ODRIVE_S1_USD,
           seller="OZ Robotics", status="Listed",
           url="https://ozrobotics.com/shop/cubemars-r80-kv110-bldc-motor-with-built-in-hall-sensor/",
-          note="Ø87 mm. Rotor inertia estimated."),
+          note="Ø87 mm. Rotor inertia estimated.",
+          cont_end=1.0, peak_end=0.0, curve_note="Rated torque held to the listed speed; peak falls toward rated near it (48 V)."),
     Motor("CubeMars R100 KV90", 3.7, 11.0, 3800, 7630e-7, 731, j_estimated=True,
           brand="CubeMars", family="Robotics torque motor", supply="48 V DC",
           drive_model="ODrive S1", price=426.90, drive_usd=ODRIVE_S1_USD,
           seller="OZ Robotics", status="Listed",
           url="https://ozrobotics.com/shop/cubemars-r100-kv90-bldc-motor-with-built-in-hall-sensor/",
-          note="35 A continuous: near ODrive S1 limit. Rotor inertia estimated."),
+          note="35 A continuous: near ODrive S1 limit. Rotor inertia estimated.",
+          cont_end=1.0, peak_end=0.0, curve_note="Rated torque held to the listed speed; peak falls toward rated near it (48 V)."),
 ]
+
+for _m in ALL_MOTORS:
+    if _m.brand == "CubeMars":              # rated torque is held right up to max_rpm
+        _m.rated_rpm, _m.peak_knee_rpm = _m.max_rpm, 0.5 * _m.max_rpm
 
 CUBEMARS_R = sorted([m for m in ALL_MOTORS if m.brand == "CubeMars"],
                     key=lambda m: (m.rated_nm, m.total_usd if m.total_usd is not None else 1e9))
@@ -541,19 +713,54 @@ INDUSTRIAL = sorted([m for m in ALL_MOTORS if m.family == "Industrial servo"],
                     key=lambda m: (m.rated_nm, m.total_usd if m.total_usd is not None else 1e9))
 
 
+def motor_inputs(inp: Inputs, m: Motor) -> Inputs:
+    """The axis inputs with a catalog motor's data filled in."""
+    return replace(inp, motor_rated_nm=m.rated_nm, motor_peak_nm=m.peak_nm,
+                   motor_max_rpm=m.max_rpm, motor_j_kgm2=m.j_kgm2, motor_rated_rpm=m.rated_rpm,
+                   env_cont_end=m.cont_end, env_peak_knee_rpm=m.peak_knee_rpm,
+                   env_peak_end=m.peak_end)
+
+
 def pick_motor(inp: Inputs, catalog=ALL_MOTORS):
-    """Size the axis once per catalog motor (its rotor inertia changes the torque)
-    and return (rows, smallest passing model)."""
-    rows, best = [], None
+    """Size the axis once per catalog motor (its rotor inertia changes the torque).
+
+    Returns (rows, picks). Each row has the motor, its result, PASS/FAIL, what it
+    fails on, how much of each limit it uses, and its headroom: 1 minus the
+    largest share of any limit used (0.4 = 40 % spare on its tightest check).
+    picks["cheapest"]: lowest listed total cost in USD that passes.
+    picks["robust"]: an industrial or integrated servo with published specs that
+    keeps at least ROBUST_RESERVE spare on every check; the smallest such motor
+    (oversizing past that only adds cost and rotor inertia), cheapest among equal
+    sizes, and one with a holding brake for a vertical axis. If none reaches
+    the reserve, the one with the most headroom.
+    """
+    rows = []
     for m in catalog:
-        r = size_axis(replace(inp, motor_rated_nm=m.rated_nm, motor_peak_nm=m.peak_nm,
-                              motor_max_rpm=m.max_rpm, motor_j_kgm2=m.j_kgm2), n=2000)
+        r = size_axis(motor_inputs(inp, m), n=2000)
         status = {c[0].split(" (")[0]: c[3] for c in r.checks}
         fails = [k for k, ok in status.items() if not ok]
+        uses = {c[0].split(" (")[0]: (c[1] / c[2] if c[2] > 0 else float("inf")) for c in r.checks}
         rows.append({"motor": m, "result": r, "ok": r.overall_ok, "fails": fails,
                      "peak_use": r.t_peak_req / m.peak_nm,
-                     "rms_use": r.t_rms_req / m.rated_nm,
-                     "speed_use": r.rpm_max / m.max_rpm})
-        if best is None and r.overall_ok:
-            best = m.model
-    return rows, best
+                     "rms_use": uses.get("RMS vs continuous torque", r.t_rms_req / m.rated_nm),
+                     "speed_use": r.rpm_max / m.max_rpm,
+                     "curve_use": uses.get("Torque at speed", 0.0),
+                     "inertia_use": uses.get("Inertia ratio", 0.0),
+                     "governing": r.governing,
+                     "headroom": 1 - max(uses.values())})
+    passing = [x for x in rows if x["ok"]]
+    priced = [x for x in passing if x["motor"].total_usd is not None]
+    robust = [x for x in passing if x["motor"].family in ROBUST_FAMILIES and not x["motor"].j_estimated]
+    picks = {
+        "cheapest": min(priced, key=lambda x: x["motor"].total_usd) if priced else None,
+        "robust": None,
+    }
+    solid = [x for x in robust if x["headroom"] >= ROBUST_RESERVE]
+    if solid:
+        # vertical axes: a motor with a holding brake first
+        picks["robust"] = min(solid, key=lambda x: (inp.vertical and "brake" not in x["motor"].model,
+                                                    round(x["motor"].rated_nm, 1),
+                                                    x["motor"].total_usd or 1e9))
+    elif robust:
+        picks["robust"] = max(robust, key=lambda x: x["headroom"])
+    return rows, picks

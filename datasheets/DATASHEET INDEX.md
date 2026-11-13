@@ -74,3 +74,40 @@ Sources
 
 Note: StepperOnline T6 kits are now checked against their 5000 rpm maximum speed (previously
 3000 rpm rated) so all servos are compared the same way.
+
+## Market search additions (checked 2026-11-12)
+
+More makers, so the app's "Cheapest that passes" and "Most robust that passes" picks come
+from a wider field. Rated speed is 3000 rpm for every AC servo here.
+
+| Motor | Drive | Rated / peak torque | Max speed | Rotor inertia | Price found |
+|---|---|---|---|---|---|
+| AutomationDirect SV2L-202N (200 W) | SV2A-2040 | 0.64 / 2.24 N·m | 6000 rpm | 0.25×10⁻⁴ kg·m² | Motor $315 (June 2025 guide) + drive $429 (current) = **$744** |
+| AutomationDirect SV2L-202B (200 W, brake) | SV2A-2040 | 0.64 / 2.24 N·m | 6000 rpm | 0.28×10⁻⁴ kg·m² | Motor $521 + drive $429 = **$950** (both current) |
+| AutomationDirect SV2L-204N (400 W) | SV2A-2040 | 1.27 / 3.96 N·m | 6000 rpm | 0.45×10⁻⁴ kg·m² | Motor $340 (2025 guide) + drive $429 = **$769** |
+| AutomationDirect SV2L-207N (750 W) | SV2A-2075 | 2.39 / 7.86 N·m | 6000 rpm | 1.51×10⁻⁴ kg·m² | Motor $364 + drive $477 (2025 guide) = **$841** |
+| Delta ECM-B3M-C20602 (200 W) | ASD-B3-0221 | 0.64 / 2.24 N·m | 6000 rpm | 0.141×10⁻⁴ kg·m² | Quote |
+| Delta ECM-B3M-C20604 (400 W) | ASD-B3-0421 | 1.27 / 4.45 N·m | 6000 rpm | 0.254×10⁻⁴ kg·m² | Motor C$918.22 (DigiKey Canada); drive quote |
+| Delta ECM-B3M-C20807 (750 W) | ASD-B3-0721 | 2.4 / 8.4 N·m | 6000 rpm | 1.07×10⁻⁴ kg·m² | Quote |
+| Omron R88M-1M40030T (400 W) | R88D-1SN04H-ECT | 1.27 / 4.5 N·m | 6000 rpm | 0.44×10⁻⁴ kg·m² | Motor NZ$2,116.95 (RS New Zealand); drive quote |
+| Leadshine ELM2H-0400LA60F (400 W) | EL7-EC400F | 1.27 / 3.81 N·m | 6500 rpm | 0.56×10⁻⁴ kg·m² | Quote |
+| Teknic ClearPath CPM-SDSK-2321S (integrated) | built in | 0.7 / 3.5 N·m at 75 V DC | 3240 rpm | 0.2×10⁻⁴ kg·m² | **$315** (Teknic), 75 V DC supply extra |
+
+Torque-speed shapes used by the app (approximate; the maker's curve is the authority):
+- AutomationDirect: peak held to ~4000 rpm, ~30 % of peak at 6000 rpm; continuous 50 % of
+  rated at 6000 rpm (read from the 230 V curves in ss2motors.pdf).
+- Other 200 V servos: peak held to rated speed, 35 % of peak at max speed; continuous 50 %.
+- ClearPath: DC-bus motor, torque falls steadily with speed (rated to ~1950 rpm, 60 % at max).
+- CubeMars: rated torque held to the listed speed, peak falling to rated there.
+
+Sources
+- SureServo2 motor specs and curves: https://cdn.automationdirect.com/static/specs/ss2motors.pdf
+- SureServo2 selection guide with list prices (June 2025): https://cdn.automationdirect.com/static/archive/specs/ss2selection-2025-06-11--01-30-34.pdf
+- SV2L-202B current price: https://www.automationdirect.com/adc/shopping/catalog/motion_control/sureservo2_(sv2a_series)_servo_systems/115-z-230v_servo_motors,_drives,_motor_cables/sv2l-202b
+- SV2A-2040 current price: https://www.automationdirect.com/adc/shopping/catalog/motion_control/sureservo2_(sv2a_series)_servo_systems/115-z-230v_servo_motors,_drives,_motor_cables/sv2a-2040
+- Delta ASDA-B3 catalog: https://www.mouser.com/datasheet/2/632/DELTA_IA_ASDA_ASDA_B3_C_EN_20230523_web-3318784.pdf
+- Delta C20604 price: https://www.digikey.ca/en/products/detail/delta-electronics-industrial-automation/ECM-B3M-C20604RS1/21852603
+- Omron 1S 400 W: https://nz.rs-online.com/web/p/servo-motors/1362816
+- Leadshine ELM2H-0400LA60F: https://www.leadshine.com/product-detail/ELM2H-0400LA60F.html
+- Teknic ClearPath CPM-SDSK-2321S-RLN: https://teknic.com/model-info/CPM-SDSK-2321S-RLN/ and
+  https://www.automationtechnologiesinc.com/products-page/servo-products/clearpath-cpm-sdsk-2321s-rln

@@ -9,6 +9,7 @@ import math
 import os
 import sys
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -16,8 +17,9 @@ import streamlit as st
 
 import extras
 
-from sizing import (ALL_MOTORS, CUBEMARS_R, DRIVES, FAMILIES, INDUSTRIAL, ODRIVE_S1_USD, PRESETS, Inputs, pick_motor,
-                    profile_timeseries, size_axis)
+import validation
+from sizing import (ALL_MOTORS, DRIVES, FAMILIES, ODRIVE_S1_USD, PRESETS, ROBUST_RESERVE, Inputs,
+                    pick_motor, profile_timeseries, size_axis, torque_envelope)
 
 # Running on your own Mac (full features) or hosted online (no local folders).
 IS_LOCAL = sys.platform == "darwin" or os.environ.get("MOTION_SIZER_LOCAL") == "1"
@@ -46,6 +48,7 @@ def load_preset(name: str):
     for k, v in p.items():
         st.session_state[k] = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
     st.session_state["use_motor"] = True
+    st.session_state.pop("env_for", None)
     st.session_state["active_preset"] = name
 
 
@@ -74,6 +77,7 @@ def load_design_cb(path: str):
     for k, v in p.items():
         if k in DEFAULTS:
             st.session_state[k] = float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+    st.session_state.pop("env_for", None)
     st.session_state["use_motor"] = any(p.get(k, 0) > 0 for k in
                                         ("motor_rated_nm", "motor_peak_nm", "motor_max_rpm", "motor_j_kgm2"))
     st.session_state["design_msg"] = f"Loaded design: {d['name']}"
@@ -117,6 +121,13 @@ def use_catalog_motor(model: str):
     st.session_state["motor_peak_nm"] = float(m.peak_nm)
     st.session_state["motor_max_rpm"] = float(m.max_rpm)
     st.session_state["motor_j_kgm2"] = float(m.j_kgm2)
+    st.session_state["motor_rated_rpm"] = float(m.rated_rpm)
+    # The motor's torque-speed shape follows it until its ratings are edited by hand.
+    st.session_state["env_cont_end"] = float(m.cont_end)
+    st.session_state["env_peak_knee_rpm"] = float(m.peak_knee_rpm)
+    st.session_state["env_peak_end"] = float(m.peak_end)
+    st.session_state["env_for"] = (m.rated_nm, m.peak_nm, m.max_rpm, m.rated_rpm)
+    st.session_state["motor_label"] = m.model
     st.session_state["use_motor"] = True
 
 
@@ -167,7 +178,7 @@ h1 { font-weight: 600 !important; }
 [data-testid="stMetric"] { border-color: rgba(242, 140, 40, 0.55) !important; box-shadow: var(--glow); }
 
 /* Title block */
-.tb { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)) 1.15fr;
+.tb { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)) 1.5fr;
       border: 1.5px solid var(--amber); background: #121C2A; margin: 0 0 1.6rem 0; box-shadow: var(--glow); }
 .tb > div { padding: 0.55rem 0.8rem; border-right: 1px solid #33445C; min-width: 0; }
 .tb > div:last-child { border-right: none; }
@@ -175,7 +186,7 @@ h1 { font-weight: 600 !important; }
 .tb .v { font-family: 'IBM Plex Sans Condensed', 'IBM Plex Sans', sans-serif; font-weight: 600;
          font-size: 1.05rem; color: #E6EDF5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tb .verdict { display: flex; flex-direction: column; justify-content: center; }
-.tb .verdict .v { font-size: 1.35rem; }
+.tb .verdict .v { font-size: 1.1rem; white-space: normal; line-height: 1.25; }
 .tb .pass { background: #0F3B2A; } .tb .pass .v { color: #5BE0A0; }
 .tb .fail { background: #4A1A18; } .tb .fail .v { color: #FF8A80; }
 .tb .open { background: #1B2738; } .tb .open .v { color: #9FB0C6; }
@@ -268,6 +279,9 @@ with st.sidebar:
         if st.session_state["use_motor"]:
             num("Rated (continuous) torque (N·m)", "motor_rated_nm", step=0.01)
             num("Peak torque (N·m)", "motor_peak_nm", step=0.01)
+            num("Rated speed (rpm)", "motor_rated_rpm", step=100.0, fmt="%.0f",
+                help="Speed up to which the motor delivers its rated torque, from the datasheet. "
+                     "Most 200 V servos: 3000 rpm.")
             num("Max speed (rpm)", "motor_max_rpm", step=100.0, fmt="%.0f")
             num("Rotor inertia (kg·m²)", "motor_j_kgm2", step=1e-6, fmt="%.3e",
                 help="Datasheets often list this in kg·cm² or g·cm². "
@@ -283,19 +297,21 @@ with st.sidebar:
 # --------------------------------------------------------------------------
 vals = {f.name: st.session_state[f.name] for f in fields(Inputs) if f.name in st.session_state}
 vals["vertical"] = st.session_state["orientation"] == "Vertical"
+MOTOR_KEYS = ("motor_rated_nm", "motor_peak_nm", "motor_max_rpm", "motor_j_kgm2", "motor_rated_rpm")
 if not st.session_state["use_motor"]:
-    for k in ("motor_rated_nm", "motor_peak_nm", "motor_max_rpm", "motor_j_kgm2"):
+    for k in MOTOR_KEYS:
         vals[k] = 0.0
+# Typed-in motors get the standard servo curve shape; a catalog motor keeps its own.
+env_for = st.session_state.get("env_for")
+now = (vals["motor_rated_nm"], vals["motor_peak_nm"], vals["motor_max_rpm"], vals["motor_rated_rpm"])
+if env_for is None or tuple(map(float, env_for)) != tuple(map(float, now)):
+    for k in ("env_cont_end", "env_peak_knee_rpm", "env_peak_end"):
+        vals[k] = DEFAULTS[k]
+    st.session_state.pop("motor_label", None)
 inp = Inputs(**vals)
 r = size_axis(inp)
 t, pos, vel, acc, tq = profile_timeseries(inp, r)
 N = inp.gear_ratio
-
-
-def eq(formula: str, numbers: str, meaning: str):
-    st.latex(formula)
-    st.latex(numbers)
-    st.markdown(f"*{meaning}*")
 
 
 def eq(formula: str, numbers: str, meaning: str):
@@ -315,23 +331,21 @@ def price_txt(m):
     return f"{sym}{m.price:,.2f}"
 
 
-def tightest(x):
-    return max(("peak torque", x["peak_use"]), ("continuous torque", x["rms_use"]),
-               ("speed", x["speed_use"]), key=lambda t: t[1])
+DECIDES = {"Peak torque": "peak torque", "Torque at speed": "torque at speed",
+           "RMS vs continuous torque": "continuous (RMS) torque", "Max speed": "top speed",
+           "Inertia ratio": "inertia ratio"}
+
+
+def decides_txt(gov):
+    return f"{DECIDES.get(gov[0], gov[0].lower())}, {gov[1] * 100:.0f}% of its limit" if gov else "—"
 
 
 # Motor comparison is computed once and used by several tabs.
-rows, _ = pick_motor(inp, ALL_MOTORS)
+rows, picks = pick_motor(inp, ALL_MOTORS)
 rows_sorted = sorted(rows, key=lambda x: (not x["ok"], x["motor"].total_usd is None,
                                           x["motor"].total_usd or 0))
 passing = [x for x in rows_sorted if x["ok"]]
 priced = [x for x in passing if x["motor"].total_usd is not None]
-ind_order = {m.model: i for i, m in enumerate(INDUSTRIAL)}
-ind_pass = sorted([x for x in rows if x["motor"].family == "Industrial servo" and x["ok"]],
-                  key=lambda x: ind_order[x["motor"].model])
-cube_order = {m.model: i for i, m in enumerate(CUBEMARS_R)}
-cube_pass = sorted([x for x in rows if x["motor"].brand == "CubeMars" and x["ok"]],
-                   key=lambda x: cube_order[x["motor"].model])
 n_fail = sum(1 for c in r.checks if not c[3])
 critical, notes = r.warnings[:n_fail], r.warnings[n_fail:]
 
@@ -350,7 +364,7 @@ if r.overall_ok is None:
 else:
     v_cls = "pass" if r.overall_ok else "fail"
     v_key = "Motor check"
-    v_val = "PASS" if r.overall_ok else f"FAIL: {n_fail} of {len(r.checks)} checks"
+    v_val = "Passes preliminary checks" if r.overall_ok else f"Fails {n_fail} of {len(r.checks)} checks"
 st.markdown(f"""
 <div class="tb">
   <div><div class="k">Drive</div><div class="v">{drive_txt}</div></div>
@@ -384,10 +398,17 @@ with tab_res:
 
     for msg in critical:
         st.error(msg)
+    if r.brake_note:
+        st.warning(r.brake_note)
     if r.checks:
+        who = st.session_state.get("motor_label", "the motor you entered")
+        st.markdown(f"**What decides {who}:** {decides_txt(r.governing)}. "
+                    + ("That's the check to watch if the axis gets faster or heavier."
+                       if r.overall_ok else "Fix that one first."))
         st.dataframe(pd.DataFrame(
             [{"Motor check": n, "Required": f"{req:.4g}", "Motor / limit": f"{av:.4g}",
-              "Result": "PASS ✅" if ok else "FAIL ❌"} for n, req, av, ok in r.checks]),
+              "Used": f"{req / av * 100:.0f}%" if av > 0 else "—",
+              "Result": "Pass ✅" if ok else "Fail ❌"} for n, req, av, ok in r.checks]),
             hide_index=True, width="stretch")
     if notes:
         with st.expander(f"Engineering notes ({len(notes)})"):
@@ -409,9 +430,9 @@ with tab_res:
         fig.update_yaxes(title_text=ytitle, title_standoff=8, row=row, col=col)
         fig.update_xaxes(title_text="Time (s)", title_standoff=6, row=row, col=col)
     if inp.motor_rated_nm > 0:
-        for sgn in (1, -1):
-            fig.add_hline(y=sgn * inp.motor_rated_nm, line_dash="dot", line_color="#8FA2BA",
-                          annotation_text="motor rated" if sgn > 0 else None, row=2, col=2)
+        fig.add_hline(y=inp.motor_rated_nm, line_dash="dot", line_color="#8FA2BA",
+                      annotation_text="motor rated", row=2, col=2)
+        fig.add_hline(y=-inp.motor_rated_nm, line_dash="dot", line_color="#8FA2BA", row=2, col=2)
     if inp.motor_peak_nm > 0 and inp.motor_peak_nm < 3 * max(abs(tq.max()), abs(tq.min()), 1e-9):
         fig.add_hline(y=inp.motor_peak_nm, line_dash="dash", line_color="#8FA2BA",
                       annotation_text="motor peak", row=2, col=2)
@@ -425,24 +446,75 @@ with tab_res:
                       font=dict(family="IBM Plex Sans, sans-serif", color="#E6EDF5", size=12))
     st.plotly_chart(fig, theme=None, config={"displaylogo": False})
 
+    if inp.motor_peak_nm > 0 and inp.motor_rated_nm > 0 and inp.motor_max_rpm > 0:
+        st.subheader("Torque vs speed")
+        st.markdown("Each dot is one instant of the cycle: the speed the motor is turning and "
+                    "the torque it must give there (with safety factor). Every dot must sit "
+                    "inside the peak zone, and the RMS point inside the continuous zone. Torque "
+                    "falls off as a motor nears top speed, so a motor can pass the peak-torque "
+                    "and speed checks separately and still fail here.")
+        rated_rpm = inp.motor_rated_rpm if inp.motor_rated_rpm > 0 else inp.motor_max_rpm / 2
+        nn = np.linspace(0, inp.motor_max_rpm, 300)
+        cont_c, pk_c = torque_envelope(nn, inp.motor_rated_nm, inp.motor_peak_nm, rated_rpm,
+                                       inp.motor_max_rpm, inp.env_cont_end,
+                                       inp.env_peak_knee_rpm, inp.env_peak_end)
+        sp = np.abs(r.rpm)
+        need = np.abs(tq) * inp.safety_factor
+        n_avg = float(np.average(sp, weights=np.r_[np.diff(t), t[-1] - t[-2]]))
+        tsf = go.Figure()
+        tsf.add_trace(go.Scatter(x=np.r_[nn, nn[::-1]], y=np.r_[pk_c, np.zeros_like(nn)],
+                                 fill="toself", fillcolor="rgba(242,140,40,0.12)",
+                                 line=dict(color="#F28C28", width=2), name="Peak zone (short bursts)",
+                                 hoverinfo="skip"))
+        tsf.add_trace(go.Scatter(x=np.r_[nn, nn[::-1]], y=np.r_[cont_c, np.zeros_like(nn)],
+                                 fill="toself", fillcolor="rgba(56,189,248,0.18)",
+                                 line=dict(color="#38BDF8", width=2), name="Continuous zone",
+                                 hoverinfo="skip"))
+        tsf.add_trace(go.Scatter(x=sp, y=need, mode="markers", name="This cycle",
+                                 marker=dict(color="#F87171", size=5),
+                                 hovertemplate="%{x:,.0f} rpm<br>%{y:.3f} N·m<extra></extra>"))
+        tsf.add_trace(go.Scatter(x=[n_avg], y=[r.t_rms_req], mode="markers", name="RMS at average speed",
+                                 marker=dict(color="#4ADE80", size=14, symbol="diamond",
+                                             line=dict(color="#0E1622", width=1.5)),
+                                 hovertemplate="RMS %{y:.3f} N·m at %{x:,.0f} rpm<extra></extra>"))
+        tsf.update_xaxes(title_text="Motor speed (rpm)", range=[0, inp.motor_max_rpm * 1.05],
+                         showgrid=True, gridcolor="#223047", title_font=dict(size=13, color="#9FB0C6"))
+        tsf.update_yaxes(title_text="Torque (N·m)", rangemode="tozero", showgrid=True,
+                         gridcolor="#223047", title_font=dict(size=13, color="#9FB0C6"))
+        tsf.update_layout(height=430, margin=dict(l=70, r=30, t=20, b=60),
+                          paper_bgcolor="#121C2A", plot_bgcolor="#121C2A",
+                          legend=dict(orientation="h", y=1.02, yanchor="bottom", x=0),
+                          font=dict(family="IBM Plex Sans, sans-serif", color="#E6EDF5", size=12))
+        st.plotly_chart(tsf, theme=None, config={"displaylogo": False})
+        st.caption("Zones are drawn from the motor's rated torque, peak torque, rated speed and max "
+                   "speed with a typical servo shape; catalog motors use their maker's published "
+                   "shape where available. The real curve depends on the drive and supply voltage, "
+                   "so check the datasheet curve before buying.")
+
     st.subheader("Cycle phases")
     st.dataframe(pd.DataFrame([{"Phase": n, "Duration (s)": round(d, 4),
-                                "Force on load (N)": round(f, 3),
-                                "Motor torque (N·m)": round(tqv, 4)} for n, d, f, tqv in r.phases]),
+                                "Motor torque, lowest (N·m)": round(lo, 4),
+                                "Motor torque, highest (N·m)": round(hi, 4),
+                                "Force on load at peak torque (N)": round(f, 3)}
+                               for (n, d, f, _), (lo, hi) in zip(r.phases, r.phase_ranges)]),
                  hide_index=True, width="stretch")
-    st.caption("Not modeled: how torque falls near a motor's top speed, settling time, belt "
-               "and coupling stiffness, positioning accuracy, and component life. The safety "
-               "factor covers small unknowns; confirm a final choice in the motor maker's "
-               "sizing software.")
+    st.caption("With S-curve smoothing, torque changes during each speed-up and slow-down, so "
+               "each phase shows its full range. The force is the force on the load at the "
+               "instant of that phase's largest torque.")
+    st.caption("Not modeled: the motor's exact torque-speed curve (an approximate one is used), "
+               "settling time, belt and coupling stiffness, positioning accuracy, ball screw "
+               "critical speed and life, and cable-carrier forces. The safety factor covers "
+               "small unknowns; confirm a final choice in the motor maker's sizing software.")
 
 # --------------------------------------------------------------------------
 # Tab 2: Motor selection
 # --------------------------------------------------------------------------
 with tab_mot:
-    st.markdown("Every motor in the catalog is run against your axis, including its own rotor "
-                "inertia. Bigger motors also spend torque spinning themselves up, so bigger "
-                "isn't always better.")
-
+    makers = sorted({m.brand for m in ALL_MOTORS})
+    st.markdown(f"A market search across {len(makers)} makers ({', '.join(makers)}): "
+                f"{len(ALL_MOTORS)} motors, each run against your axis with its own rotor "
+                "inertia and torque-speed shape. Bigger motors also spend torque spinning "
+                "themselves up, so bigger isn't always better.")
 
     def cost_txt(m):
         if m.total_usd is not None:
@@ -450,32 +522,43 @@ with tab_mot:
         if m.price is not None and m.currency == "USD":
             return f"${m.price:,.0f} + drive"
         if m.price is not None:
-            return f"{price_txt(m)} + driver"
+            return f"{price_txt(m)} + drive"
         return "Quote"
 
-
-    def card(col, title, x, key, empty):
+    def card(col, title, why, x, key, empty):
         with col.container(border=True):
             st.markdown(f"**{title}**")
+            st.caption(why)
             if x is None:
                 st.markdown(empty)
                 return
             mm = x["motor"]
-            tt = tightest(x)
-            drive = "drive included" if mm.drive_included else f"drive {mm.drive_model}"
+            drive = "drive built in" if mm.drive_model == "built in" else (
+                "drive included" if mm.drive_included else f"drive {mm.drive_model}")
             st.markdown(f"#### {mm.model}")
-            st.markdown(f"**{cost_txt(mm)}**, {mm.supply}, {drive}  \n"
-                        f"Tightest limit: {tt[0]} at {pct(tt[1])}  \n"
+            st.markdown(f"**{cost_txt(mm)}** total · {mm.family}, {mm.supply}, {drive}  \n"
+                        f"Reserve on its tightest check: **{x['headroom'] * 100:.0f}%**  \n"
+                        f"What decides it: {decides_txt(x['governing'])}  \n"
                         f"Availability: {mm.status}")
-            st.button("Use this motor in the motor check", key=key,
+            if inp.vertical and "brake" not in mm.model:
+                st.caption("Vertical axis: order this motor's brake version.")
+            st.button("Check this motor in detail", key=key,
                       on_click=use_catalog_motor, args=(mm.model,))
 
-
     rc1, rc2 = st.columns(2)
-    card(rc1, "Industrial servo: smallest that passes", ind_pass[0] if ind_pass else None,
-         "load_ind", "No industrial servo in the catalog passes this axis.")
-    card(rc2, "Lowest listed total cost that passes", priced[0] if priced else None,
-         "load_cheapest", "None of the priced motors pass this axis.")
+    card(rc1, "Cheapest that passes",
+         "Lowest listed total price in US dollars, motor plus drive. Prices in other currencies "
+         "and quote-only motors can't be ranked.",
+         picks["cheapest"], "load_cheapest", "None of the priced motors pass this axis.")
+    card(rc2, "Most robust that passes",
+         f"An industrial or integrated servo with published specs that keeps at least "
+         f"{ROBUST_RESERVE * 100:.0f}% in reserve on every check, the smallest that does"
+         + (", with a holding brake" if inp.vertical else "")
+         + ". Going bigger only adds cost and rotor inertia.",
+         picks["robust"], "load_robust", "No industrial or integrated servo in the catalog passes.")
+    if picks["robust"] is not None and picks["robust"]["headroom"] < ROBUST_RESERVE:
+        st.warning(f"No servo keeps {ROBUST_RESERVE * 100:.0f}% in reserve on every check, so "
+                   "this is the one with the most. Consider a gearbox or a slower move.")
     if not passing:
         st.error("No motor in the catalog passes. Try a gearbox (multiplies torque, divides "
                  "reflected inertia), a longer move or accel time, or a finer screw lead or "
@@ -486,34 +569,42 @@ with tab_mot:
     shown = [x for x in rows_sorted if fam in (None, "All") or x["motor"].family == fam]
     st.dataframe(pd.DataFrame([{
         "Motor": x["motor"].model,
-        "Result": "PASS ✅" if x["ok"] else "FAIL ❌",
+        "Result": "Pass ✅" if x["ok"] else "Fail ❌",
         "Total cost": cost_txt(x["motor"]),
+        "Reserve": f"{x['headroom'] * 100:.0f}%",
+        "What decides it": DECIDES.get(x["governing"][0], "—") if x["governing"] else "—",
         "Peak torque used": pct(x["peak_use"]),
+        "Torque at speed used": pct(x["curve_use"]),
         "Continuous used": pct(x["rms_use"]),
         "Speed used": pct(x["speed_use"]),
         "Inertia ratio": f"{x['result'].inertia_ratio:.2f} : 1",
         "Fails on": ", ".join(x["fails"]) or "—",
         "Type": x["motor"].family,
         "Supply": x["motor"].supply,
-        "Drive": ("Included" if x["motor"].drive_included else
+        "Drive": ("Built in" if x["motor"].drive_model == "built in" else
+                  "Included" if x["motor"].drive_included else
                   x["motor"].drive_model + (f" (${x['motor'].drive_usd:,.0f})" if x["motor"].drive_usd else " (quote)")),
         "Rated / peak (N·m)": f"{x['motor'].rated_nm} / {x['motor'].peak_nm}",
-        "Max speed (rpm)": f"{x['motor'].max_rpm:,.0f}",
+        "Rated / max speed (rpm)": f"{x['motor'].rated_rpm:,.0f} / {x['motor'].max_rpm:,.0f}",
         "Rotor inertia (g·cm²)": ("≈" if x["motor"].j_estimated else "") + f"{x['motor'].j_kgm2 * 1e7:,.0f}",
+        "Price as listed": price_txt(x["motor"]),
         "Availability": x["motor"].status,
         "Source": x["motor"].url,
     } for x in shown]), hide_index=True, width="stretch",
         column_config={"Source": st.column_config.LinkColumn("Source", display_text="Open")})
     st.caption("Sorted: passing first, then by listed total cost. % used = what the axis needs "
-               "(with safety factor) ÷ what the motor can do. Industrial servos run on 200 V AC "
-               "with a matching drive; prices are new-unit distributor list prices, and most "
-               "makers sell through distributors on quote. Budget kits include their drive. "
+               "(with safety factor) ÷ what the motor can do; reserve = 100% minus the largest. "
+               "\"Smallest\" and \"cheapest\" mean within this catalog, not the whole market. "
+               "Industrial servos run on 200–230 V AC with a matching drive; most makers sell "
+               "through distributors on quote. Budget kits include their drive. ClearPath has its "
+               "drive built in and needs a 75 V DC supply. "
                f"CubeMars robotics motors need a 48 V driver (ODrive S1, ${ODRIVE_S1_USD:.0f}). "
-               "≈ = estimated rotor inertia. Checked online 2026-11-12; prices change.")
+               "Power supplies are not included in any total. ≈ = estimated rotor inertia. "
+               "Checked online 2026-11-12; prices change.")
 
     st.subheader("Datasheets")
     model_names = [x["motor"].model for x in rows_sorted]
-    default_model = priced[0]["motor"].model if priced else model_names[0]
+    default_model = picks["cheapest"]["motor"].model if picks["cheapest"] else model_names[0]
     if not IS_LOCAL:
         st.caption("Open the manufacturer's datasheet or product page for any motor in the table.")
         dc1, dc2 = st.columns(2)
@@ -680,8 +771,9 @@ with tab_how:
             st.markdown(f"*Moving back down, gravity helps: steady torque is "
                         f"{r.t_back_const:.5f} N·m instead of {r.t_const_phase:.5f} N·m going up. "
                         "During dwell the motor holds the load against gravity.*")
-        st.markdown("*The app evaluates these at 6,000 points through the cycle, so the S-curve "
-                    "ramps and every change of direction are included.*")
+        st.markdown("*The app evaluates these at about 6,000 points through the cycle, with "
+                    "nearly all of them inside the moves (torque doesn't change while stopped), "
+                    "so even a 20 ms move sitting in a long dwell is finely resolved.*")
 
     with st.expander("Step 7: Peak and RMS torque"):
         eq(r"T_{rms} = \sqrt{\dfrac{1}{t_{cycle}}\int_0^{t_{cycle}} T(t)^2\,dt}",
@@ -697,7 +789,35 @@ with tab_how:
            rf"T_{{peak,req}} = {r.t_peak:.4f} \times {inp.safety_factor:.2f} = {r.t_peak_req:.4f}"
            rf"\qquad T_{{rms,req}} = {r.t_rms:.4f} \times {inp.safety_factor:.2f} = {r.t_rms_req:.4f}",
            "Margin covers what the model leaves out: coupling inertia, cable carriers, "
-           "torque fall-off near top speed, and tuning.")
+           "and tuning.")
+
+    with st.expander("Step 8: Torque vs speed (the motor's envelope)"):
+        st.markdown("A motor's torque isn't fixed. Two zones describe it:")
+        st.markdown("- **Continuous zone:** rated torque holds up to rated speed, then falls "
+                    "(to about half at max speed for a typical 200 V servo). Run here all day.\n"
+                    "- **Peak zone:** peak torque for short bursts, held to roughly rated speed, "
+                    "then falling steeply. The drive's voltage runs out as the motor's "
+                    "back-EMF rises with speed, so less current, and torque, gets in.")
+        eq(r"T_{avail}(n) = T_{peak} - (T_{peak} - T_{end})\,\dfrac{n - n_{knee}}{n_{max} - n_{knee}}"
+           r"\quad (n > n_{knee})",
+           r"\text{check: } T(t)\cdot SF \le T_{avail}(n(t)) \text{ at every instant}",
+           "The app checks every instant of the cycle against the peak zone at that instant's "
+           "speed, and the RMS torque against the continuous zone at the average speed.")
+        if r.checks and r.env_rpm_worst:
+            st.markdown(f"*Tightest point for the motor entered: {r.env_rpm_worst:,.0f} rpm.*")
+
+    with st.expander("Checked against six independent hand calculations"):
+        st.markdown("Each case is a simple axis worked out on paper (in validation.py, without "
+                    "using the app's engine), then run through the app. All must agree within "
+                    "0.1%. They run live, right now.")
+        vt = validation.table()
+        st.dataframe(pd.DataFrame([{
+            "Case": v["Case"], "What it proves": v["Rule"], "Quantity": v["Quantity"],
+            "Hand calc": f"{v['Hand calc']:.6g}", "App": f"{v['App']:.6g}",
+            "Match": "✅" if v["Match"] else "❌"} for v in vt]), hide_index=True, width="stretch")
+        n_ok = sum(v["Match"] for v in vt)
+        st.caption(f"{n_ok} of {len(vt)} quantities match. HAND_CALC.md also works the Heavy "
+                   "shuttle example step by step.")
 
 
 # --------------------------------------------------------------------------
@@ -764,8 +884,13 @@ with tab_des:
         ("inertia_ratio", r.inertia_ratio), ("rpm_max", r.rpm_max),
         ("T_peak_Nm", r.t_peak), ("T_rms_Nm", r.t_rms),
         ("T_peak_required_Nm", r.t_peak_req), ("T_rms_required_Nm", r.t_rms_req),
-        ("motor_check", "n/a" if r.overall_ok is None else ("PASS" if r.overall_ok else "FAIL"))]]
-    csv_rows += [("Phase", n, f"{d:.4f} s | {f:.3f} N | {tv:.5f} N·m") for n, d, f, tv in r.phases]
+        ("motor_check", "n/a" if r.overall_ok is None else
+         ("passes preliminary checks" if r.overall_ok else "fails")),
+        ("what_decides_it", decides_txt(r.governing)),
+        ("cheapest_passing", picks["cheapest"]["motor"].model if picks["cheapest"] else "none"),
+        ("most_robust_passing", picks["robust"]["motor"].model if picks["robust"] else "none")]]
+    csv_rows += [("Phase", n, f"{d:.4f} s | torque {lo:.5f} to {hi:.5f} N·m | {f:.3f} N at peak")
+                 for (n, d, f, _), (lo, hi) in zip(r.phases, r.phase_ranges)]
     buf = io.StringIO()
     pd.DataFrame(csv_rows, columns=["Section", "Item", "Value"]).to_csv(buf, index=False)
     st.download_button("Download results as CSV", buf.getvalue(),

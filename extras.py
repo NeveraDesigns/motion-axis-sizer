@@ -104,6 +104,47 @@ DOCS.update({
          "https://us.mitsubishielectric.com/fa/en/products/drive-products/ac-servos-melservo/mrje/motor/specifications/", None),
     ],
 })
+_AD_MOTORS = ("AutomationDirect SureServo2 motor specs (all 230 V motors)", "pdf",
+              "https://cdn.automationdirect.com/static/specs/ss2motors.pdf",
+              "AutomationDirect_SureServo2_motors.pdf")
+_AD_GUIDE = ("SureServo2 selection guide with list prices (June 2025)", "pdf",
+             "https://cdn.automationdirect.com/static/archive/specs/ss2selection-2025-06-11--01-30-34.pdf",
+             "AutomationDirect_SureServo2_selection_2025-06.pdf")
+_DELTA = ("Delta ASDA-B3 catalog", "pdf",
+          "https://www.mouser.com/datasheet/2/632/DELTA_IA_ASDA_ASDA_B3_C_EN_20230523_web-3318784.pdf",
+          "Delta_ASDA-B3_catalog.pdf")
+DOCS.update({
+    "AutomationDirect SV2L-202N (200 W)": [_AD_MOTORS, _AD_GUIDE],
+    "AutomationDirect SV2L-202B (200 W, brake)": [
+        ("SV2L-202B product page (price)", "page",
+         "https://www.automationdirect.com/adc/shopping/catalog/motion_control/sureservo2_(sv2a_series)_servo_systems/115-z-230v_servo_motors,_drives,_motor_cables/sv2l-202b", None),
+        ("SV2L-202B cut sheet", "pdf",
+         "https://cdn.automationdirect.com/static/specs/cutsheet/SV2L-202B_cutsheet.pdf",
+         "AutomationDirect_SV2L-202B_cutsheet.pdf"),
+        _AD_MOTORS],
+    "AutomationDirect SV2L-204N (400 W)": [_AD_MOTORS, _AD_GUIDE],
+    "AutomationDirect SV2L-207N (750 W)": [
+        ("SV2L-207B cut sheet (brake version)", "pdf",
+         "https://cdn.automationdirect.com/static/specs/cutsheet/SV2L-207B_cutsheet.pdf",
+         "AutomationDirect_SV2L-207B_cutsheet.pdf"),
+        _AD_MOTORS, _AD_GUIDE],
+    "Delta ECM-B3M-C20602 (200 W)": [_DELTA],
+    "Delta ECM-B3M-C20604 (400 W)": [
+        _DELTA,
+        ("DigiKey listing (price)", "page",
+         "https://www.digikey.ca/en/products/detail/delta-electronics-industrial-automation/ECM-B3M-C20604RS1/21852603", None)],
+    "Delta ECM-B3M-C20807 (750 W)": [_DELTA],
+    "Omron R88M-1M40030T (400 W)": [
+        ("RS listing (specs and price)", "page", "https://nz.rs-online.com/web/p/servo-motors/1362816", None)],
+    "Leadshine ELM2H-0400LA60F (400 W)": [
+        ("Leadshine ELM2H-0400LA60F product page", "page",
+         "https://www.leadshine.com/product-detail/ELM2H-0400LA60F.html", None)],
+    "Teknic ClearPath CPM-SDSK-2321S": [
+        ("Teknic model page (price, torque-speed curve)", "page",
+         "https://teknic.com/model-info/CPM-SDSK-2321S-RLN/", None),
+        ("Reseller spec summary (Automation Technologies)", "page",
+         "https://www.automationtechnologiesinc.com/products-page/servo-products/clearpath-cpm-sdsk-2321s-rln", None)],
+})
 DOCS["StepperOnline T6 400W kit"] = DOCS.pop("StepperOnline T6 400W kit (T6-RS400H2A3-M17S)")
 DOCS["StepperOnline T6 1000W kit"] = DOCS.pop("StepperOnline T6 1000W kit (T6-RS1000H2A3-M17S)")
 DRIVER_DOC = ("ODrive S1 driver datasheet (for CubeMars motors)", "page",
@@ -203,10 +244,8 @@ def delete_design(d):
 def summarize(inp: Inputs):
     """Key numbers for one design (used by the compare table and the report)."""
     r = size_axis(inp)
-    rows, _ = pick_motor(inp, ALL_MOTORS)
-    priced = sorted([x for x in rows if x["ok"] and x["motor"].total_usd is not None],
-                    key=lambda x: x["motor"].total_usd)
-    cheapest = priced[0] if priced else None
+    rows, picks = pick_motor(inp, ALL_MOTORS)
+    cheapest, robust = picks["cheapest"], picks["robust"]
     return {
         "Drive": inp.drive + (f" + {inp.gear_ratio:g}:1 gearbox" if inp.gear_ratio != 1 else ""),
         "Orientation": "Vertical" if inp.vertical else "Horizontal",
@@ -217,9 +256,10 @@ def summarize(inp: Inputs):
         "Max motor speed (rpm)": round(r.rpm_max),
         "Peak torque req. (N·m)": round(r.t_peak_req, 4),
         "RMS torque req. (N·m)": round(r.t_rms_req, 4),
-        "Motor entered": ("PASS" if r.overall_ok else "FAIL") if r.overall_ok is not None else "none",
+        "Motor entered": ("Passes prelim. checks" if r.overall_ok else "Fails") if r.overall_ok is not None else "none",
         "Cheapest passing motor": cheapest["motor"].model if cheapest else "none in catalog",
         "Its total cost (USD)": round(cheapest["motor"].total_usd, 2) if cheapest else None,
+        "Most robust passing motor": robust["motor"].model if robust else "none in catalog",
         "Motors passing": f"{sum(x['ok'] for x in rows)} of {len(rows)}",
     }
 
@@ -242,7 +282,7 @@ def build_report(inp: Inputs, title: str = "Motion axis sizing report") -> bytes
     from fpdf import FPDF
 
     r = size_axis(inp)
-    rows, _ = pick_motor(inp, ALL_MOTORS)
+    rows, picks = pick_motor(inp, ALL_MOTORS)
     pdf = FPDF(orientation="P", unit="mm", format="Letter")
     pdf.set_auto_page_break(auto=True, margin=12)
     pdf.add_page()
@@ -323,14 +363,22 @@ def build_report(inp: Inputs, title: str = "Motion axis sizing report") -> bytes
     if r.checks:
         section("Motor check (motor entered in the app)")
         table(["Check", "Required", "Motor / limit", "Result"],
-              [(n, f"{q:.4g}", f"{a:.4g}", "PASS" if ok else "FAIL") for n, q, a, ok in r.checks],
+              [(n, f"{q:.4g}", f"{a:.4g}", "Pass" if ok else "Fail") for n, q, a, ok in r.checks],
               [W * 0.4, W * 0.2, W * 0.2, W * 0.2])
 
+    for label, key in (("Cheapest that passes", "cheapest"), ("Most robust that passes", "robust")):
+        x = picks[key]
+        pdf.set_font("Helvetica", "", 9)
+        pdf.cell(W, 5, _t(f"{label}: " + (f"{x['motor'].model}, "
+                          + (f"${x['motor'].total_usd:,.0f}" if x["motor"].total_usd is not None else "quote")
+                          + f", {x['headroom'] * 100:.0f}% reserve" if x else "none in catalog")),
+                 new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
     section("Motor comparison (prices checked 2026-11-12; totals include the drive)")
     srt = sorted(rows, key=lambda x: (not x["ok"], x["motor"].total_usd is None,
                                       x["motor"].total_usd or 0))
     table(["Motor", "Result", "Total USD", "Supply", "Peak", "Cont.", "Speed", "J ratio"],
-          [(x["motor"].model, "PASS" if x["ok"] else "FAIL",
+          [(x["motor"].model, "Pass" if x["ok"] else "Fail",
             f"${x['motor'].total_usd:,.0f}" if x["motor"].total_usd is not None else "quote",
             x["motor"].supply, f"{x['peak_use'] * 100:.0f}%", f"{x['rms_use'] * 100:.0f}%",
             f"{x['speed_use'] * 100:.0f}%", f"{x['result'].inertia_ratio:.2f}")

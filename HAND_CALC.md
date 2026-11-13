@@ -67,6 +67,11 @@ each accel period at each end, so peak acceleration rises to v / (t_a − t_j) =
 **0.304 N·m**. Top speed is unchanged. The app calculates the S-curve case by evaluating
 torque at 6,000 points through the cycle.
 
+## Six more cases
+`validation.py` works six simpler axes by hand (frictionless, drag and efficiency, vertical
+lift/lower/hold, a 5:1 gearbox, S-curve 0/50/100 %, and a 10 mm move in 40 ms followed by
+a 2 s dwell). The app shows hand vs app for each under *How it's calculated*.
+
 ## Takeaway for the interview
 Before drag torque was included, this axis looked like it needed 0.156 N·m peak and
 0.089 N·m RMS. With realistic drag and the return move, it needs **0.251 N·m peak and

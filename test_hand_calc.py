@@ -6,6 +6,10 @@ Checks the sizing engine against independent hand calculations.
 2. S-curve smoothing: peak acceleration must equal v / (ta - tj).
 3. Gearbox: reflected inertia drops with ratio², motor speed rises with ratio.
 4. Vertical axis: gravity opposes the lift and helps on the way down.
+5. The six-case validation set in validation.py (also shown in the app).
+6. Short, sharp S-curve move with a long dwell: the sampled peak acceleration
+   must land within 0.5 % of the true peak.
+7. Torque-speed envelope: the shape passes through its defining points.
 
 Run it with:   python3 test_hand_calc.py
 """
@@ -13,7 +17,10 @@ Run it with:   python3 test_hand_calc.py
 import math
 from dataclasses import replace
 
-from sizing import PRESETS, size_axis
+import numpy as np
+
+import validation
+from sizing import PRESETS, Inputs, size_axis, torque_envelope
 
 # ---- Hand calculation: Heavy shuttle, trapezoid ---------------------------------
 m = 5.0 + 1.0                       # kg
@@ -94,11 +101,33 @@ def test_vertical_gravity_helps_on_the_way_down():
     assert r.t_dwell_phase > 0                       # holding against gravity
 
 
+def test_validation_set():
+    bad = [r for r in validation.table() if not r["Match"]]
+    assert not bad, bad
+
+
+def test_short_move_peak_is_captured():
+    inp = replace(validation._screw(stroke_mm=5, move_time_s=0.02, dwell_s=3.0), s_curve_pct=100)
+    r = size_axis(inp)
+    assert np.max(np.abs(r.acc)) >= 0.995 * r.a
+
+
+def test_torque_envelope_shape():
+    cont, pk = torque_envelope([0, 3000, 6000, 6001], rated=1.0, peak=3.0, rated_rpm=3000,
+                               max_rpm=6000, cont_end=0.5, peak_knee_rpm=4000, peak_end=0.3)
+    assert np.allclose(cont[:3], [1.0, 1.0, 0.5]) and cont[3] == 0
+    assert np.allclose(pk[:3], [3.0, 3.0, 0.9]) and pk[3] == 0
+
+
 if __name__ == "__main__":
     test_heavy_shuttle_matches_hand_calc()
     test_s_curve_peak_acceleration()
     test_gearbox_divides_inertia_by_ratio_squared()
     test_vertical_gravity_helps_on_the_way_down()
+    test_validation_set()
+    test_short_move_peak_is_captured()
+    test_torque_envelope_shape()
+    print(f"Validation set: {len(validation.table())} quantities in 6 cases match hand calcs.")
     print("All checks PASSED. Heavy shuttle (trapezoid) vs hand calculation:")
     r = size_axis(shuttle_trapezoid(), n=12000)
     for name, hand in expected.items():
