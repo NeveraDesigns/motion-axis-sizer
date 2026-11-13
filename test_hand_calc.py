@@ -6,7 +6,7 @@ Checks the sizing engine against independent hand calculations.
 2. S-curve smoothing: peak acceleration must equal v / (ta - tj).
 3. Gearbox: reflected inertia drops with ratio², motor speed rises with ratio.
 4. Vertical axis: gravity opposes the lift and helps on the way down.
-5. The six-case validation set in validation.py (also shown in the app).
+5. The seven-case validation set in validation.py (also shown in the app).
 6. Short, sharp S-curve move with a long dwell: the sampled peak acceleration
    must land within 0.5 % of the true peak.
 7. Torque-speed envelope: the shape passes through its defining points.
@@ -119,6 +119,35 @@ def test_torque_envelope_shape():
     assert np.allclose(pk[:3], [3.0, 3.0, 0.9]) and pk[3] == 0
 
 
+def test_heating_check_weights_each_instant():
+    # Below rated speed the continuous zone is flat, so the check is plain RMS vs rated.
+    base = validation._screw(motor_rated_nm=0.5, motor_peak_nm=1.5, motor_max_rpm=6000,
+                             motor_rated_rpm=4000)
+    r = size_axis(base)
+    c = {n.split(" (")[0]: (q, a) for n, q, a, ok in r.checks}
+    assert abs(c["RMS vs continuous torque"][1] - 0.5) < 1e-9
+    # Fast moves near top speed with a long dwell: weighting by each instant's
+    # speed must be at least as strict as using one average speed.
+    hot = replace(base, motor_max_rpm=1.02 * r.rpm_max, motor_rated_rpm=0.2 * r.rpm_max,
+                  dwell_s=3.0)
+    rh = size_axis(hot)
+    n_avg = np.sum(np.abs(rh.rpm) * np.r_[np.diff(rh.ts), 0]) / rh.t_cycle
+    cont_avg = float(torque_envelope(n_avg, 0.5, 1.5, hot.motor_rated_rpm, hot.motor_max_rpm)[0])
+    avail = {n.split(" (")[0]: a for n, q, a, ok in rh.checks}["RMS vs continuous torque"]
+    assert avail < cont_avg
+
+
+def test_time_above_rated():
+    # Rated torque set just under the accel torque: only the speed-up and slow-down
+    # stretches are above it, each one accel time long.
+    base = validation._screw(eta=1.0, drag=0.0)
+    r0 = size_axis(base)
+    inp = replace(base, motor_rated_nm=0.9 * r0.t_peak, motor_peak_nm=3 * r0.t_peak,
+                  motor_max_rpm=3 * r0.rpm_max, motor_rated_rpm=3 * r0.rpm_max)
+    r = size_axis(inp)
+    assert abs(r.t_over_rated_s - r.t_acc) < 0.01 * r.t_acc
+
+
 if __name__ == "__main__":
     test_heavy_shuttle_matches_hand_calc()
     test_s_curve_peak_acceleration()
@@ -127,7 +156,9 @@ if __name__ == "__main__":
     test_validation_set()
     test_short_move_peak_is_captured()
     test_torque_envelope_shape()
-    print(f"Validation set: {len(validation.table())} quantities in 6 cases match hand calcs.")
+    test_heating_check_weights_each_instant()
+    test_time_above_rated()
+    print(f"Validation set: {len(validation.table())} quantities in {len(validation.cases())} cases match hand calcs.")
     print("All checks PASSED. Heavy shuttle (trapezoid) vs hand calculation:")
     r = size_axis(shuttle_trapezoid(), n=12000)
     for name, hand in expected.items():

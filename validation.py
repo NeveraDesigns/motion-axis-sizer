@@ -1,5 +1,5 @@
 """
-Validation set: six independent hand calculations the sizing engine must match.
+Validation set: seven independent hand calculations the sizing engine must match.
 
 Each case sets up a simple axis whose answer can be worked out on paper, works
 it out here without using the engine, then runs the engine and compares. The
@@ -111,6 +111,29 @@ def cases():
     out.append(("Short move, long dwell", "10 mm in 40 ms, then 2 s stopped: RMS by hand",
                 [("Peak torque (N·m)", max(abs(T_acc), abs(T_dec)), r.t_peak),
                  ("RMS torque (N·m)", rms, r.t_rms)]))
+    # 7. Built to fail torque-at-speed while passing peak torque and top speed --
+    # Frictionless and lossless, so torque is pure inertia while speeding up or
+    # slowing down and zero while cruising. The motor has 1.5x the peak torque
+    # needed and 5 % speed to spare, but its peak torque falls off steeply above
+    # 30 % of the move's top speed. Near top speed it can give only about a
+    # quarter of its peak, so the hardest instant (end of speed-up, start of
+    # slow-down) must fail.
+    inp = _screw(eta=1.0, drag=0.0)
+    k, Js, T, ta, v = _geom(inp)
+    a = v / ta
+    T_acc = (inp.payload_kg * k**2 + Js + inp.motor_j_kgm2) * a / k
+    rpm_top = v / k * 60 / (2 * math.pi)
+    inp = replace(inp, motor_peak_nm=1.5 * T_acc, motor_rated_nm=0.5 * T_acc,
+                  motor_max_rpm=1.05 * rpm_top, motor_rated_rpm=0.3 * rpm_top,
+                  env_peak_knee_rpm=0.0, env_peak_end=0.2)
+    # Peak zone at top speed: 1.5·T_acc·(1 − 0.8·(1 − 0.3)/(1.05 − 0.3)) ≈ 0.38·T_acc
+    r = size_axis(inp)
+    c = {name.split(" (")[0]: (req, ok) for name, req, avail, ok in r.checks}
+    out.append(("Fails torque at speed", "Enough peak torque and speed, but not both at once",
+                [("Torque needed at hardest instant (N·m)", T_acc, c["Torque at speed"][0]),
+                 ("Peak-torque check passes (1 = yes)", 1.0, float(c["Peak torque"][1])),
+                 ("Top-speed check passes (1 = yes)", 1.0, float(c["Max speed"][1])),
+                 ("Torque-at-speed check passes (1 = yes)", 0.0, float(c["Torque at speed"][1]))]))
     return out
 
 

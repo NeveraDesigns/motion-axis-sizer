@@ -130,6 +130,8 @@ class Results:
     t_rms: float = 0.0
     t_peak_req: float = 0.0
     t_rms_req: float = 0.0
+    thermal_use: float = 0.0       # heating-weighted share of continuous torque used
+    t_over_rated_s: float = 0.0    # longest stretch above continuous torque (s)
     phases: list = field(default_factory=list)   # (name, duration, force N at peak torque, peak torque N·m)
     phase_ranges: list = field(default_factory=list)  # (lowest, highest) motor torque in each phase
     rpm: np.ndarray | None = None  # motor speed (signed) over the cycle
@@ -367,12 +369,34 @@ def size_axis(inp: Inputs, n: int = 6000) -> Results:
                          float(pk_avail[i]), bool(use[i] <= 1.0)))
     if inp.motor_rated_nm > 0:
         if have_env:
-            n_avg = float(np.sum(rpm_abs * wts) / r.t_cycle)
-            cont_avail = float(torque_envelope(n_avg, inp.motor_rated_nm, inp.motor_peak_nm,
-                                               rated_rpm, inp.motor_max_rpm, inp.env_cont_end,
-                                               inp.env_peak_knee_rpm, inp.env_peak_end)[0])
+            # Heating check at each instant's own speed: (torque / continuous torque
+            # available at that speed)², averaged over the whole cycle. Using one
+            # average speed would let long dwells pull the speed down and hide fast,
+            # hot moves near top speed.
+            cont_t = torque_envelope(rpm_abs, inp.motor_rated_nm, inp.motor_peak_nm,
+                                     rated_rpm, inp.motor_max_rpm, inp.env_cont_end,
+                                     inp.env_peak_knee_rpm, inp.env_peak_end)[0]
         else:
-            cont_avail = inp.motor_rated_nm
+            cont_t = np.full_like(rpm_abs, inp.motor_rated_nm)
+        need_c = np.abs(tq) * inp.safety_factor
+        ratio = np.where(cont_t > 0, need_c / np.maximum(cont_t, 1e-12),
+                         np.where(need_c > 0, 1e6, 0.0))
+        r.thermal_use = float(np.sqrt(np.sum(ratio**2 * wts) / r.t_cycle))
+        # Shown as the continuous torque the motor effectively offers this cycle, so
+        # required ÷ available = thermal use (equals rated torque below rated speed).
+        cont_avail = r.t_rms_req / r.thermal_use if r.thermal_use > 0 else inp.motor_rated_nm
+        # Point 4: longest unbroken stretch above continuous torque (cycle repeats,
+        # so a stretch can wrap from the end of the cycle to the start).
+        over = ratio > 1.0 + 1e-9
+        if over.all():
+            r.t_over_rated_s = r.t_cycle
+        elif over.any():
+            o2, w2 = np.r_[over, over], np.r_[wts, wts]
+            run = best = 0.0
+            for o, wt in zip(o2, w2):
+                run = run + wt if o else 0.0
+                best = max(best, run)
+            r.t_over_rated_s = float(min(best, r.t_cycle))
         r.checks.append(("RMS vs continuous torque (N·m)", r.t_rms_req, cont_avail,
                          r.t_rms_req <= cont_avail))
     if inp.motor_max_rpm > 0:
@@ -408,8 +432,8 @@ def size_axis(inp: Inputs, n: int = 6000) -> Results:
                          "with more speed headroom, a finer screw lead or a smaller pulley.")
             elif name.startswith("RMS"):
                 w.append(f"RMS torque ({req:.3f} N·m with safety factor) exceeds the motor's "
-                         f"continuous torque ({avail:.3f} N·m at this axis's average speed). The motor will overheat over "
-                         "time. Add dwell, slow the move, or pick a bigger motor.")
+                         f"continuous torque ({avail:.3f} N·m, weighted by speed over the cycle). The motor will "
+                         "overheat over time. Add dwell, slow the move, or pick a bigger motor.")
             elif name.startswith("Max speed"):
                 w.append(f"Required speed ({req:.0f} rpm) is above the motor's max "
                          f"({avail:.0f} rpm). Use a longer screw lead or bigger pulley, or "
@@ -439,6 +463,10 @@ def size_axis(inp: Inputs, n: int = 6000) -> Results:
             + (", and a belt or rack axis drops immediately" if inp.drive != "Ball screw"
                else ", and most ball screws back-drive")
             + ". Choose the motor's brake option (or a counterbalance) so the load can't fall.")
+    if r.t_over_rated_s > 2.0:
+        w.append(f"The motor runs above its continuous torque for {r.t_over_rated_s:.2f} s at a "
+                 "stretch. Servo drives allow about 3x rated torque only for limited bursts, "
+                 "often a few seconds. Check the drive's overload curve.")
     if inp.motor_rated_nm > 0 and inp.motor_rated_rpm <= 0 and inp.motor_max_rpm > 0:
         w.append("Rated speed not entered, so the torque-vs-speed check assumes half the max "
                  "speed. Enter the datasheet's rated speed for a better check.")
@@ -487,7 +515,7 @@ PRESETS = {
 #     (ODrive S1, $149, used for total cost).
 #
 # max_rpm: the maker's maximum speed for servos; for CubeMars the speed held at
-# rated torque. Torque falls near max speed; that curve is not modeled.
+# rated torque. Torque-speed curves are approximate (see Motor.curve_label).
 # Rotor inertia marked estimated: CubeMars R80/R100/RO80 (scaled from published
 # R60 and RO80 Lite values).
 # ---------------------------------------------------------------------------
@@ -523,6 +551,14 @@ class Motor:
     peak_knee_rpm: float = 0.0        # peak torque held up to here (0 = rated speed)
     peak_end: float = 0.35            # peak-zone torque at max speed, fraction of peak
     curve_note: str = "Approximate shape from rated, peak and speed ratings."
+
+    @property
+    def curve_label(self):
+        """Honest one-line label: every curve here is approximate."""
+        volts = self.supply.split(" (")[0]
+        if self.curve_note.startswith("Shape from"):
+            return f"Fitted to published curve ({volts})"
+        return f"Estimated envelope ({volts})"
 
     @property
     def total_usd(self):

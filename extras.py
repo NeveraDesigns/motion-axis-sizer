@@ -209,13 +209,44 @@ def _slug(name: str) -> str:
     return s[:60] or "design"
 
 
+DESIGN_FORMAT_VERSION = 1
+
+
+def _design_dict(name: str, inp: Inputs, notes: str = "") -> dict:
+    return {"app": "Motion Axis Sizer", "format_version": DESIGN_FORMAT_VERSION,
+            "name": name.strip(), "saved": _dt.datetime.now().isoformat(timespec="seconds"),
+            "notes": notes, "inputs": asdict(inp)}
+
+
 def save_design(name: str, inp: Inputs, notes: str = "") -> Path:
     DESIGN_DIR.mkdir(exist_ok=True)
-    data = {"name": name.strip(), "saved": _dt.datetime.now().isoformat(timespec="seconds"),
-            "notes": notes, "inputs": asdict(inp)}
     p = DESIGN_DIR / f"{_slug(name)}.json"
-    p.write_text(json.dumps(data, indent=2))
+    p.write_text(json.dumps(_design_dict(name, inp, notes), indent=2))
     return p
+
+
+def design_json(name: str, inp: Inputs, notes: str = "") -> bytes:
+    """A design as a downloadable file (same format as the saved designs)."""
+    return json.dumps(_design_dict(name, inp, notes), indent=2).encode()
+
+
+def parse_design(raw: bytes) -> dict:
+    """Read a design file. Unknown inputs are ignored and missing ones keep their
+    defaults, so files from older or newer versions still open."""
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise ValueError("That file isn't a design file (it couldn't be read as JSON).")
+    if not isinstance(d, dict) or not isinstance(d.get("inputs"), dict):
+        raise ValueError("That file isn't a Motion Axis Sizer design file (no inputs found).")
+    v = d.get("format_version", 1)
+    if not isinstance(v, int) or v > DESIGN_FORMAT_VERSION:
+        raise ValueError(f"This design file is format version {v}; this app reads up to "
+                         f"version {DESIGN_FORMAT_VERSION}. Update the app to open it.")
+    valid = {f.name for f in fields(Inputs)}
+    d["inputs"] = {k: val for k, val in d["inputs"].items() if k in valid}
+    d.setdefault("name", "Opened design")
+    return d
 
 
 def list_designs():
@@ -259,7 +290,7 @@ def summarize(inp: Inputs):
         "Motor entered": ("Passes prelim. checks" if r.overall_ok else "Fails") if r.overall_ok is not None else "none",
         "Cheapest passing motor": cheapest["motor"].model if cheapest else "none in catalog",
         "Its total cost (USD)": round(cheapest["motor"].total_usd, 2) if cheapest else None,
-        "Most robust passing motor": robust["motor"].model if robust else "none in catalog",
+        "Industrial servo, 30%+ reserve": robust["motor"].model if robust else "none in catalog",
         "Motors passing": f"{sum(x['ok'] for x in rows)} of {len(rows)}",
     }
 
@@ -366,7 +397,7 @@ def build_report(inp: Inputs, title: str = "Motion axis sizing report") -> bytes
               [(n, f"{q:.4g}", f"{a:.4g}", "Pass" if ok else "Fail") for n, q, a, ok in r.checks],
               [W * 0.4, W * 0.2, W * 0.2, W * 0.2])
 
-    for label, key in (("Cheapest that passes", "cheapest"), ("Most robust that passes", "robust")):
+    for label, key in (("Cheapest that passes", "cheapest"), ("Industrial servo, 30%+ reserve", "robust")):
         x = picks[key]
         pdf.set_font("Helvetica", "", 9)
         pdf.cell(W, 5, _t(f"{label}: " + (f"{x['motor'].model}, "

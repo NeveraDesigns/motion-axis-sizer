@@ -28,12 +28,13 @@ it used.
 - **Searches the market.** 24 motors from 10 makers: industrial servos (Yaskawa,
   Panasonic, Mitsubishi, Delta, Omron, Leadshine, AutomationDirect), an integrated servo
   (Teknic ClearPath), budget servo kits (StepperOnline) and robotics torque motors
-  (CubeMars). It picks the **cheapest that passes** and the **most robust that passes**:
-  the smallest industrial servo that keeps at least 30 % in reserve on every check (with
-  a brake on vertical axes).
+  (CubeMars). It picks the **cheapest that passes** and an **industrial servo with 30 %+ reserve**:
+  the smallest industrial servo that uses at most 70 % of every limit (with a brake on
+  vertical axes). All torque-speed curves are approximate and labeled as such.
 - **Shows its work.** Every formula is shown with your numbers plugged in and a sentence on
   what it means physically.
-- **Saves and compares designs** side by side, and exports a one-page PDF report or a CSV.
+- **Saves and compares designs** side by side, downloads and reopens design files, and
+  exports a one-page PDF report or a CSV.
 
 ![Motor selection tab](docs/screenshot-motors.png)
 
@@ -55,9 +56,10 @@ streamlit run app.py
 
 ## Check the math
 
-`HAND_CALC.md` works the "Heavy shuttle" example by hand. `validation.py` holds six more
+`HAND_CALC.md` works the "Heavy shuttle" example by hand. `validation.py` holds seven more
 independent hand calculations (frictionless axis, drag and efficiency, vertical lift/lower/
-hold, gearbox, S-curve limits, and a very short move in a long dwell); the app shows them
+hold, gearbox, S-curve limits, a very short move in a long dwell, and a motor built to fail
+the torque-at-speed check); the app shows them
 live under *How it's calculated*. `test_hand_calc.py` runs them all, to within 0.1 %:
 
 ```
@@ -71,7 +73,7 @@ python test_hand_calc.py
 | `app.py` | The screens: inputs, results, motor selection, equations, designs |
 | `sizing.py` | The engineering math and the motor catalog (no screen code) |
 | `extras.py` | Datasheet links, saved designs and the PDF report |
-| `validation.py` | Six independent hand calculations the engine must match |
+| `validation.py` | Seven independent hand calculations the engine must match |
 | `test_hand_calc.py` | Runs the hand calculations and other checks |
 | `HAND_CALC.md` | The hand calculation, step by step |
 | `Start Motion Sizer.command` | Mac: double-click to run the app |

@@ -70,8 +70,7 @@ PRESET_INFO = {
 }
 
 
-def load_design_cb(path: str):
-    d = next(x for x in extras.list_designs() if str(x["_path"]) == path)
+def apply_design(d):
     p = dict(d["inputs"])
     st.session_state["orientation"] = "Vertical" if p.pop("vertical", False) else "Horizontal"
     for k, v in p.items():
@@ -81,6 +80,20 @@ def load_design_cb(path: str):
     st.session_state["use_motor"] = any(p.get(k, 0) > 0 for k in
                                         ("motor_rated_nm", "motor_peak_nm", "motor_max_rpm", "motor_j_kgm2"))
     st.session_state["design_msg"] = f"Loaded design: {d['name']}"
+
+
+def load_design_cb(path: str):
+    apply_design(next(x for x in extras.list_designs() if str(x["_path"]) == path))
+
+
+def open_design_file_cb():
+    up = st.session_state.get("design_upload")
+    if up is None:
+        return
+    try:
+        apply_design(extras.parse_design(up.getvalue()))
+    except ValueError as e:
+        st.session_state["design_err"] = str(e)
 
 
 def ds_request(model: str, idx: int):
@@ -450,7 +463,8 @@ with tab_res:
         st.subheader("Torque vs speed")
         st.markdown("Each dot is one instant of the cycle: the speed the motor is turning and "
                     "the torque it must give there (with safety factor). Every dot must sit "
-                    "inside the peak zone, and the RMS point inside the continuous zone. Torque "
+                    "inside the peak zone. For heating, each instant is compared with the continuous "
+                    "zone at its own speed and the results are added up over the cycle. Torque "
                     "falls off as a motor nears top speed, so a motor can pass the peak-torque "
                     "and speed checks separately and still fail here.")
         rated_rpm = inp.motor_rated_rpm if inp.motor_rated_rpm > 0 else inp.motor_max_rpm / 2
@@ -473,7 +487,7 @@ with tab_res:
         tsf.add_trace(go.Scatter(x=sp, y=need, mode="markers", name="This cycle",
                                  marker=dict(color="#F87171", size=5),
                                  hovertemplate="%{x:,.0f} rpm<br>%{y:.3f} N·m<extra></extra>"))
-        tsf.add_trace(go.Scatter(x=[n_avg], y=[r.t_rms_req], mode="markers", name="RMS at average speed",
+        tsf.add_trace(go.Scatter(x=[n_avg], y=[r.t_rms_req], mode="markers", name="RMS torque (at average speed)",
                                  marker=dict(color="#4ADE80", size=14, symbol="diamond",
                                              line=dict(color="#0E1622", width=1.5)),
                                  hovertemplate="RMS %{y:.3f} N·m at %{x:,.0f} rpm<extra></extra>"))
@@ -486,10 +500,16 @@ with tab_res:
                           legend=dict(orientation="h", y=1.02, yanchor="bottom", x=0),
                           font=dict(family="IBM Plex Sans, sans-serif", color="#E6EDF5", size=12))
         st.plotly_chart(tsf, theme=None, config={"displaylogo": False})
-        st.caption("Zones are drawn from the motor's rated torque, peak torque, rated speed and max "
-                   "speed with a typical servo shape; catalog motors use their maker's published "
-                   "shape where available. The real curve depends on the drive and supply voltage, "
-                   "so check the datasheet curve before buying.")
+        cat_m = next((m for m in ALL_MOTORS if m.model == st.session_state.get("motor_label")), None)
+        curve_lbl = (f"{cat_m.model}: {cat_m.curve_label}." if cat_m else
+                     "Typed-in motor: Estimated envelope (typical servo shape).")
+        st.caption(f"Torque curve: {curve_lbl} Every curve in this app is an approximation built "
+                   "from the motor's rated torque, peak torque, rated speed and max speed. The "
+                   "real curve depends on the drive and supply voltage, so check the datasheet "
+                   "curve before buying.")
+        st.caption(f"Longest time above continuous torque: **{r.t_over_rated_s:.2f} s** at a stretch. "
+                   "Drives allow peak torque only in limited bursts; the drive's overload limit "
+                   "is not verified here.")
 
     st.subheader("Cycle phases")
     st.dataframe(pd.DataFrame([{"Phase": n, "Duration (s)": round(d, 4),
@@ -550,11 +570,14 @@ with tab_mot:
          "Lowest listed total price in US dollars, motor plus drive. Prices in other currencies "
          "and quote-only motors can't be ranked.",
          picks["cheapest"], "load_cheapest", "None of the priced motors pass this axis.")
-    card(rc2, "Most robust that passes",
+    card(rc2, f"Industrial servo, {ROBUST_RESERVE * 100:.0f}%+ reserve",
          f"An industrial or integrated servo with published specs that keeps at least "
          f"{ROBUST_RESERVE * 100:.0f}% in reserve on every check, the smallest that does"
          + (", with a holding brake" if inp.vertical else "")
-         + ". Going bigger only adds cost and rotor inertia.",
+         + ". Reserve means each check uses at most "
+         f"{100 - ROBUST_RESERVE * 100:.0f}% of the motor's limit. It is not room for "
+         f"{ROBUST_RESERVE * 100:.0f}% more payload or speed (acceleration torque grows faster "
+         "than speed), and it doesn't cover stiffness, tuning or heat in the machine.",
          picks["robust"], "load_robust", "No industrial or integrated servo in the catalog passes.")
     if picks["robust"] is not None and picks["robust"]["headroom"] < ROBUST_RESERVE:
         st.warning(f"No servo keeps {ROBUST_RESERVE * 100:.0f}% in reserve on every check, so "
@@ -584,6 +607,7 @@ with tab_mot:
         "Drive": ("Built in" if x["motor"].drive_model == "built in" else
                   "Included" if x["motor"].drive_included else
                   x["motor"].drive_model + (f" (${x['motor'].drive_usd:,.0f})" if x["motor"].drive_usd else " (quote)")),
+        "Torque curve": x["motor"].curve_label,
         "Rated / peak (N·m)": f"{x['motor'].rated_nm} / {x['motor'].peak_nm}",
         "Rated / max speed (rpm)": f"{x['motor'].rated_rpm:,.0f} / {x['motor'].max_rpm:,.0f}",
         "Rotor inertia (g·cm²)": ("≈" if x["motor"].j_estimated else "") + f"{x['motor'].j_kgm2 * 1e7:,.0f}",
@@ -802,11 +826,13 @@ with tab_how:
            r"\quad (n > n_{knee})",
            r"\text{check: } T(t)\cdot SF \le T_{avail}(n(t)) \text{ at every instant}",
            "The app checks every instant of the cycle against the peak zone at that instant's "
-           "speed, and the RMS torque against the continuous zone at the average speed.")
+           "speed. For heating it divides each instant's torque by the continuous torque "
+           "available at that instant's speed, squares it and averages over the whole cycle "
+           "(dwells included). The result must stay at or below 100%.")
         if r.checks and r.env_rpm_worst:
             st.markdown(f"*Tightest point for the motor entered: {r.env_rpm_worst:,.0f} rpm.*")
 
-    with st.expander("Checked against six independent hand calculations"):
+    with st.expander("Checked against seven independent hand calculations"):
         st.markdown("Each case is a simple axis worked out on paper (in validation.py, without "
                     "using the app's engine), then run through the app. All must agree within "
                     "0.1%. They run live, right now.")
@@ -816,8 +842,10 @@ with tab_how:
             "Hand calc": f"{v['Hand calc']:.6g}", "App": f"{v['App']:.6g}",
             "Match": "✅" if v["Match"] else "❌"} for v in vt]), hide_index=True, width="stretch")
         n_ok = sum(v["Match"] for v in vt)
-        st.caption(f"{n_ok} of {len(vt)} quantities match. HAND_CALC.md also works the Heavy "
-                   "shuttle example step by step.")
+        st.caption(f"{n_ok} of {len(vt)} quantities match. These prove these checks, not the "
+                   "whole model. HAND_CALC.md also works the Heavy shuttle example step by step. "
+                   "For an outside check, enter the same axis in a maker's sizing tool such as "
+                   "Yaskawa SigmaSelect and compare.")
 
 
 # --------------------------------------------------------------------------
@@ -828,19 +856,29 @@ with tab_des:
                 "one-page PDF report to bring to a review or interview.")
     if not IS_LOCAL:
         st.info("You're using the online version. Saved designs are kept only until the app "
-                "restarts, so download the PDF report or CSV to keep your results.")
+                "restarts, so use Download design file to keep a design and Open design file "
+                "to bring it back.")
     if st.session_state.get("design_msg"):
         st.success(st.session_state.pop("design_msg"))
+    if st.session_state.get("design_err"):
+        st.error(st.session_state.pop("design_err"))
     sc1, sc2 = st.columns([2, 3])
     d_name = sc1.text_input("Design name", placeholder="e.g. Pick X axis, belt, 0.7 kg")
     d_notes = sc2.text_input("Notes (optional)", placeholder="what you changed or why")
-    cs1, cs2 = st.columns(2)
+    cs1, cs2, cs3 = st.columns(3)
     if cs1.button("Save this design", type="primary", disabled=not d_name.strip()):
         p = extras.save_design(d_name, inp, d_notes)
         st.success(f"Saved to designs/{p.name}")
-    cs2.download_button("Download PDF report", extras.build_report(inp, d_name.strip() or "Motion axis sizing report"),
+    cs2.download_button("Download design file",
+                        extras.design_json(d_name.strip() or "Untitled design", inp, d_notes),
+                        file_name=f"{extras._slug(d_name or 'design')}.json", mime="application/json")
+    cs3.download_button("Download PDF report", extras.build_report(inp, d_name.strip() or "Motion axis sizing report"),
                         file_name=f"{(d_name.strip() or 'motion_sizing_report').replace(' ', '_')}.pdf",
                         mime="application/pdf")
+
+    st.file_uploader("Open design file", type=["json"], key="design_upload",
+                     on_change=open_design_file_cb,
+                     help="A .json file from Download design file. Loads its inputs into the sidebar.")
 
     saved = extras.list_designs()
     if saved:
@@ -888,7 +926,7 @@ with tab_des:
          ("passes preliminary checks" if r.overall_ok else "fails")),
         ("what_decides_it", decides_txt(r.governing)),
         ("cheapest_passing", picks["cheapest"]["motor"].model if picks["cheapest"] else "none"),
-        ("most_robust_passing", picks["robust"]["motor"].model if picks["robust"] else "none")]]
+        ("industrial_servo_30pct_reserve", picks["robust"]["motor"].model if picks["robust"] else "none")]]
     csv_rows += [("Phase", n, f"{d:.4f} s | torque {lo:.5f} to {hi:.5f} N·m | {f:.3f} N at peak")
                  for (n, d, f, _), (lo, hi) in zip(r.phases, r.phase_ranges)]
     buf = io.StringIO()
