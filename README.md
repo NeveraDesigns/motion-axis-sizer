@@ -61,6 +61,8 @@ python test_hand_calc.py
 | `extras.py` | Datasheet links, saved designs and the PDF report |
 | `test_hand_calc.py` | Checks the math against an independent hand calculation |
 | `HAND_CALC.md` | The hand calculation, step by step |
+| `Start Motion Sizer.command` | Mac: double-click to run the app |
+| `Publish to GitHub.command` | Mac: double-click to upload your latest changes to GitHub |
 | `datasheets/DATASHEET INDEX.md` | Sources, specs and prices for every motor in the catalog |
 
 ## Model assumptions
